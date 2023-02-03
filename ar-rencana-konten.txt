@@ -2,10 +2,12 @@ RENCANA KONTEN AR
 
 - Javascript
   * ES6
-  * Framework Javascript
-   ^ Angular
+  *Framework Javascript
+   ^ Vue
    ^ React
+ - Struktur Data Dasar
 - PHP framework
- * Laravel
+ *Laravel
 - Interview
 - Vlogs
+- Python
