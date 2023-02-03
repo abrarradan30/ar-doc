@@ -5,7 +5,7 @@ RENCANA KONTEN AR
   *Framework Javascript
    ^ Vue
    ^ React
- - Struktur Data Dasar
+- Struktur Data Dasar
 - PHP framework
  *Laravel
 - Interview
