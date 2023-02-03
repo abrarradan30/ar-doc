@@ -1,0 +1,8 @@
+RENCANA KONTEN AR
+
+- Javascript
+  * ES6
+  *Framework Javascript
+- PHP framework
+- Interview
+- Vlogs
