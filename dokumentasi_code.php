@@ -338,3 +338,21 @@
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
         }
     }
+
+// 11. scope menggunakan query 
+    public function scopeGetPBDetail($query)
+    {
+        return $query->select('t_penerimaan.id as penerimaan_id','t_penerimaan.*', 'po.*', 'supplier.*', 'item.*')
+            ->join('t_po_bahan as po', 't_penerimaan.t_po_bahan_id', '=', 'po.id')
+            ->join('m_supplier as supplier', 'po.m_supplier_id', '=', 'supplier.id')
+            ->join('m_item as item', 'po.m_item_id', '=', 'item.id')
+            ->leftJoin('t_pi_bahan_d as pi_d', 't_penerimaan.id', '=', 'pi_d.t_penerimaan_id')
+            ->where('t_penerimaan.status', 'POST')
+            ->whereNotIn('t_penerimaan.id', function ($subquery) {
+                $subquery->select('t_pi_bahan_d.t_penerimaan_id')
+                    ->from('t_pi_bahan_d')
+                    ->join('t_pi_bahan', 't_pi_bahan.id', '=', 't_pi_bahan_d.t_pi_bahan_id')
+                    ->where('t_pi_bahan.status', 'POST');
+            })
+            ->orderByDesc('t_penerimaan.id');
+    }
