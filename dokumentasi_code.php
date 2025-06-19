@@ -379,3 +379,46 @@ const value = parseFloat(params.value);
 return isNaN(value) ? '' : value.toFixed(0); // untuk mengatur 0 setelah koma
 }
 },
+
+15. custom update saldo accounting
+protected static function updateSaldoKas()
+    {
+        // Hitung total POST penerimaan
+        $totalPenerimaan = \DB::table('t_penerimaan_kas')
+                            ->where('status', 'POST')
+                            ->sum('jumlah');
+
+        // Hitung total POST pengeluaran
+        $totalPengeluaran = \DB::table('t_pengeluaran_kas')
+                            ->where('status', 'POST')
+                            ->sum('jumlah');
+
+        // Saldo akhir
+        $saldoAkhir = $totalPenerimaan - $totalPengeluaran;
+
+        // Simpan ke tabel t_saldo
+        // Diasumsikan hanya 1 baris di tabel t_saldo, misal ID=1
+        \DB::table('t_saldo')->updateOrInsert(
+            ['id' => 1],
+            ['saldo' => $saldoAkhir]
+        );
+
+        return $saldoAkhir;
+    }
+
+    public function custom_post()
+    {
+        $id = request('id');
+
+        // 1. Update status jadi POST
+        $updated = $this->where('id', $id)->update(['status' => 'POST']);
+
+        // 2. Update saldo keseluruhan
+        $saldo = self::updateSaldoKas();
+
+        // 3. Return
+        return [
+            'success' => (bool) $updated,
+            'saldo'   => (float) $saldo,
+        ];
+    }
