@@ -1,0 +1,296 @@
+@php
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+$req     = app()->request;
+$helper  = getCore('Helper');
+
+// =================== EXPORT HANDLING ===================
+$exportParam   = strtolower((string)($req->get('export') ?? ''));
+$isExcelExport = in_array($exportParam, ['xls','xlsx','excel','csv'], true);
+
+$fmtExportPlain = fn($v) => (int)round((float)($v ?? 0));
+$cellNumberStyle = "mso-number-format:'\\0022Rp\\0022 #,##0';";
+
+// =================== PARAMETER ===================
+$gudangId   = $req->get('gudang_id');
+$kavlingId  = $req->get('kavling_id');
+$periodeFrom = $req->get('periode_from') ? date('Y-m-d', strtotime($req->get('periode_from'))) : null;
+$periodeTo   = $req->get('periode_to') ? date('Y-m-d', strtotime($req->get('periode_to'))) : null;
+
+// =================== SALDO AWAL ===================
+$stokAwal = 0;
+
+if ($periodeFrom) {
+    $stokManual = null;
+
+    if (Schema::hasTable('t_input_stock')) {
+        try {
+            $stokManual = DB::table('t_input_stock')
+                ->whereDate('tgl','<',$periodeFrom)
+                ->when($gudangId, fn($q)=>$q->where('m_gudang_id',$gudangId))
+                ->when($kavlingId, fn($q)=>$q->where('m_gudang_d_id',$kavlingId))
+                ->orderBy('tgl','desc')
+                ->value('stok');
+        } catch (\Exception $e) {
+            $stokManual = null;
+        }
+    }
+
+    if ($stokManual !== null) {
+        $stokAwal = $stokManual;
+    } else {
+        $poBefore = DB::table('t_penerimaan as tp')
+            ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+            ->where('tp.status','POST')
+            ->whereDate('tp.tgl_penerimaan','<',$periodeFrom)
+            ->when($gudangId, fn($q)=>$q->where('tp.m_gudang_id',$gudangId))
+            ->when($kavlingId, fn($q)=>$q->where('tp.kavling_id',$kavlingId))
+            ->sum('tp.total_netto');
+
+        $soBefore = DB::table('t_surat_jalan as tsj')
+            ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
+            ->join('t_surat_jalan_d as tsjd','tsjd.t_surat_jalan_id','=','tsj.id')
+            ->where('tsj.status','POST')
+            ->whereDate('tsj.tgl','<',$periodeFrom)
+            ->when($gudangId, fn($q)=>$q->where('tsjd.m_gudang_id',$gudangId))
+            ->when($kavlingId, fn($q)=>$q->where('tsjd.m_gudang_d_id',$kavlingId))
+            ->sum('tsjd.berat_sj');
+
+        $adjBefore = DB::table('t_adjustment_stock_d as tasd')
+            ->join('t_adjustment_stock as tas','tas.id','=','tasd.t_adjustment_stock_id')
+            ->where('tas.status','POST')
+            ->whereDate('tas.tgl','<',$periodeFrom)
+            ->when($gudangId, fn($q)=>$q->where('tas.m_gudang_id',$gudangId))
+            ->when($kavlingId, fn($q)=>$q->where('tas.m_gudang_d_id',$kavlingId))
+            ->sum('tasd.berat_adjustment');
+
+        $stokAwal = ($poBefore + $adjBefore) - $soBefore;
+    }
+}
+
+// =================== DATA BERJALAN ===================
+
+// --- 1) PO MASUK ---
+$po = DB::table('t_penerimaan as tp')
+    ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+    ->leftJoin('m_supplier as ms','ms.id','=','tpo.m_supplier_id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tp.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tp.kavling_id')
+    ->where('tp.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('tp.tgl_penerimaan','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('tp.tgl_penerimaan','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('tp.m_gudang_id',$gudangId))
+    ->when($kavlingId, fn($q)=>$q->where('tp.kavling_id',$kavlingId))
+    ->selectRaw("
+        tp.tgl_penerimaan as tanggal,
+        tpo.no_po::text as no_referensi,
+        ms.nama_supplier::text as nama_supplier_customer,
+        tp.kadar_air::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tp.total_netto::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        tp.created_at
+    ");
+
+// --- 2) SJ KELUAR ---
+$so = DB::table('t_surat_jalan as tsj')
+    ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
+    ->leftJoin('m_customer as mc','mc.id','=','tso.m_customer_id')
+    ->leftJoin('t_surat_jalan_d as tsjd','tsjd.t_surat_jalan_id','=','tsj.id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tsjd.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tsjd.m_gudang_d_id')
+    // ->where('tsj.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('tsj.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('tsj.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('tsjd.m_gudang_id',$gudangId))
+    ->when($kavlingId, fn($q)=>$q->where('tsjd.m_gudang_d_id',$kavlingId))
+    ->selectRaw("
+        tsj.tgl as tanggal,
+        tso.no_so::text as no_referensi,
+        mc.nama::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        NULL::numeric as berat_masuk,
+        COALESCE(tsjd.berat_sj,0)::numeric as berat_keluar,
+        tsj.created_at
+    ");
+
+// --- 3) ADJUSTMENT ---
+$adjustment = DB::table('t_adjustment_stock_d as tasd')
+    ->join('t_adjustment_stock as tas','tas.id','=','tasd.t_adjustment_stock_id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tas.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tas.m_gudang_d_id')
+    ->where('tas.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('tas.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('tas.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('tas.m_gudang_id',$gudangId))
+    ->when($kavlingId, fn($q)=>$q->where('tas.m_gudang_d_id',$kavlingId))
+    ->selectRaw("
+        tas.tgl as tanggal,
+        tas.no_adj::text as no_referensi,
+        'Adjustment Stock'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        CASE WHEN tasd.berat_adjustment > 0 THEN tasd.berat_adjustment ELSE NULL END::numeric as berat_masuk,
+        CASE WHEN tasd.berat_adjustment < 0 THEN ABS(tasd.berat_adjustment) ELSE NULL END::numeric as berat_keluar,
+        tas.created_at
+    ");
+
+// --- 4) TRANSFER GUDANG ---
+$transferAsal = DB::table('t_transfer_gudang as ttg')
+    ->leftJoin('m_gudang as mg','mg.id','=','ttg.m_gudang_a_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','ttg.m_gudang_d_a_id')
+    ->where('ttg.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('ttg.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('ttg.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('ttg.m_gudang_a_id',$gudangId))
+    ->when($kavlingId, fn($q)=>$q->where('ttg.m_gudang_d_a_id',$kavlingId))
+    ->selectRaw("
+        ttg.tgl as tanggal,
+        ttg.no_tg::text as no_referensi,
+        'Transfer Gudang'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        NULL::numeric as berat_masuk,
+        COALESCE(ttg.berat,0)::numeric as berat_keluar,
+        ttg.created_at
+    ");
+
+$transferTujuan = DB::table('t_transfer_gudang as ttg')
+    ->leftJoin('m_gudang as mg','mg.id','=','ttg.m_gudang_t_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','ttg.m_gudang_d_t_id')
+    ->where('ttg.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('ttg.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('ttg.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('ttg.m_gudang_t_id',$gudangId))
+    ->when($kavlingId, fn($q)=>$q->where('ttg.m_gudang_d_t_id',$kavlingId))
+    ->selectRaw("
+        ttg.tgl as tanggal,
+        ttg.no_tg::text as no_referensi,
+        'Transfer Gudang'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        COALESCE(ttg.berat,0)::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        ttg.created_at
+    ");
+
+$transfer = $transferAsal->unionAll($transferTujuan);
+
+// --- 5) TRANSFORM ITEM (PERBAIKAN BARU) ---
+$transformAsal = DB::table('t_transform_item as tti')
+    ->leftJoin('m_gudang as mg','mg.id','=','tti.m_gudang_a_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tti.m_gudang_d_a_id')
+    ->where('tti.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('tti.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('tti.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('tti.m_gudang_a_id',$gudangId))
+    ->selectRaw("
+        tti.tgl as tanggal,
+        tti.no_ti::text as no_referensi,
+        'Transform Item'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        NULL::numeric as berat_masuk,
+        COALESCE(tti.berat,0)::numeric as berat_keluar,
+        tti.created_at
+    ");
+
+$transformTujuan = DB::table('t_transform_item as tti')
+    ->leftJoin('m_gudang as mg','mg.id','=','tti.m_gudang_t_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tti.m_gudang_d_t_id')
+    ->where('tti.status','POST')
+    ->when($periodeFrom, fn($q)=>$q->whereDate('tti.tgl','>=',$periodeFrom))
+    ->when($periodeTo, fn($q)=>$q->whereDate('tti.tgl','<=',$periodeTo))
+    ->when($gudangId, fn($q)=>$q->where('tti.m_gudang_t_id',$gudangId))
+    ->selectRaw("
+        tti.tgl as tanggal,
+        tti.no_ti::text as no_referensi,
+        'Transform Item'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        COALESCE(tti.berat,0)::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        tti.created_at
+    ");
+
+$transform = $transformAsal->unionAll($transformTujuan);
+
+// --- GABUNG SEMUA ---
+$data = DB::query()
+    ->fromSub($po
+        ->unionAll($so)
+        ->unionAll($adjustment)
+        ->unionAll($transfer)
+        ->unionAll($transform), 'history')
+    ->orderBy('tanggal','asc')
+    ->orderBy('created_at','asc')
+    ->get();
+@endphp
+
+{{-- =================== VIEW =================== --}}
+<div>
+  <div style="text-align:center; margin-bottom:10px;">
+    <h1 style="font-weight:bold; margin:0;">LAPORAN HISTORY GUDANG</h1>
+    <p style="margin:4px 0 0 0;">
+      PERIODE 
+      {{ $req->periode_from ? $helper->formatDateId($req->periode_from) : '-' }}
+      {{ $req->periode_to ? '- '.$helper->formatDateId($req->periode_to) : '' }}
+    </p>
+  </div>
+
+  <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
+    <thead>
+      <tr>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">No.</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Tanggal</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">No Referensi</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Gudang</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Kavling</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Supplier / Customer</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">KA (%)</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Berat Masuk</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Berat Keluar</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Balance</th>
+      </tr>
+    </thead>
+    <tbody>
+      @php $balance = $stokAwal; @endphp
+      @foreach($data as $i => $row)
+        @php
+          $beratMasuk  = (float)($row->berat_masuk ?? 0);
+          $beratKeluar = (float)($row->berat_keluar ?? 0);
+          $balance += $beratMasuk - $beratKeluar;
+        @endphp
+        <tr>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">{{ $i+1 }}</td>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">{{ \Carbon\Carbon::parse($row->tanggal)->format('d/m/Y') }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->no_referensi ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_gudang ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_kavling ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_supplier_customer ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">
+            {{ isset($row->kadar_air) ? rtrim(rtrim(number_format((float)$row->kadar_air, 1, ',', ''), '0'), ',') : '' }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($beratMasuk) : number_format($beratMasuk, 0, ',', '.') }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($beratKeluar) : number_format($beratKeluar, 0, ',', '.') }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($balance) : number_format($balance, 0, ',', '.') }}
+          </td>
+        </tr>
+      @endforeach
+    </tbody>
+  </table>
+</div>

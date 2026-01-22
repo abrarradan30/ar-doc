@@ -1,0 +1,371 @@
+@php
+use Illuminate\Support\Facades\DB;
+
+$req = app()->request;
+$helper = getCore('Helper');
+
+// =========================================================
+// 0️⃣ PARAMETER & FORMATTER
+// =========================================================
+$exportParam   = strtolower((string)($req->get('export') ?? ''));
+$isExcelExport = in_array($exportParam, ['xls','xlsx','excel','csv'], true);
+
+$fmtBrowser = function ($v) {
+  $v = (float)($v ?? 0);
+  $neg = $v < 0;
+  $abs = (int)abs($v);
+  $s = 'Rp ' . number_format($abs, 0, ',', '.');
+  return $neg ? "({$s})" : $s;
+};
+$fmtBrowserNoParen = fn($v) => 'Rp ' . number_format(abs((float)($v ?? 0)), 0, ',', '.');
+$fmtExportPlain = fn($v) => (int)round((float)($v ?? 0));
+$cellNumberStyle = "mso-number-format:'\\0022Rp\\0022 #,##0';";
+$negStyle = fn($v) => ((float)($v ?? 0) < 0) ? 'color:#c00;' : 'color:#000;';
+
+$periodeFrom = $req->get('periode_from') ? date('Y-m-d', strtotime($req->get('periode_from'))) : null;
+$periodeTo   = $req->get('periode_to')   ? date('Y-m-d', strtotime($req->get('periode_to')))   : null;
+
+// =========================================================
+// 1️⃣ PENJUALAN
+// =========================================================
+$penjualan = DB::table('t_sales_invoice as si')
+  ->where('si.status', 'POST')
+  ->when($periodeFrom && $periodeTo, fn($q)=>$q->whereBetween('si.tgl', [$periodeFrom,$periodeTo]))
+  ->sum('si.grand_total');
+
+// =========================================================
+// 2️⃣ HPP & STOCK GUDANG (IDENTIK DENGAN LAPORAN STOCK)
+// =========================================================
+
+// --- Subquery harga PO ---
+$aggPiDetail = DB::table('t_pi_bahan_d as tpid')
+  ->select('tpid.t_penerimaan_id', DB::raw('AVG(tpid.harga_nett) AS avg_harga_nett'))
+  ->groupBy('tpid.t_penerimaan_id');
+
+// --- Data Masuk (PO) ---
+$dataPo = DB::table('t_penerimaan as tp')
+  ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+  ->join('m_supplier as ms','ms.id','=','tpo.m_supplier_id')
+  ->leftJoinSub($aggPiDetail,'pid',fn($j)=>$j->on('pid.t_penerimaan_id','=','tp.id'))
+  ->select(
+    'tpo.no_po as no_referensi',
+    'tp.no_penerimaan',
+    'tp.tgl_penerimaan as tanggal',
+    'ms.nama_supplier as supplier_customer',
+    DB::raw('COALESCE(MAX(pid.avg_harga_nett), tpo.harga_sepakat, 0)::numeric as harga_nett'),
+    DB::raw('SUM(tp.total_netto)::numeric as berat_masuk'),
+    DB::raw('NULL::numeric as berat_keluar'),
+    DB::raw('NULL::numeric as hpp_adj'),
+    DB::raw('NULL::numeric as total_adj'),
+    DB::raw('MIN(tp.created_at) as created_src')
+  )
+  ->where('tp.status','POST')
+  ->groupBy('tpo.no_po','tp.no_penerimaan','tp.tgl_penerimaan','ms.nama_supplier','tpo.harga_sepakat');
+
+// --- Data Keluar (SO) ---
+$dataSo = DB::table('t_surat_jalan as tsj')
+  ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
+  ->join('m_customer as mc','mc.id','=','tso.m_customer_id')
+  ->select(
+    'tso.no_so as no_referensi',
+    DB::raw('NULL::text as no_penerimaan'),
+    'tsj.tgl as tanggal',
+    'mc.nama as supplier_customer',
+    DB::raw('NULL::numeric as harga_nett'),
+    DB::raw('NULL::numeric as berat_masuk'),
+    'tsj.berat_kirim as berat_keluar',
+    DB::raw('NULL::numeric as hpp_adj'),
+    DB::raw('NULL::numeric as total_adj'),
+    DB::raw('tsj.created_at as created_src')
+  );
+
+// --- Data Adjustment ---
+$dataAdj = DB::table('t_adjustment_stock as tas')
+  ->join('t_adjustment_stock_d as tasd','tasd.t_adjustment_stock_id','=','tas.id')
+  ->select(
+    'tas.no_adj as no_referensi',
+    DB::raw('NULL::text as no_penerimaan'),
+    'tas.tgl as tanggal',
+    DB::raw("'Adjustment Stock' as supplier_customer"),
+    DB::raw('COALESCE(tasd.harga_nett,0)::numeric as harga_nett'),
+    DB::raw("CASE WHEN tasd.berat_adjustment > 0 THEN tasd.berat_adjustment ELSE NULL END::numeric as berat_masuk"),
+    DB::raw("CASE WHEN tasd.berat_adjustment < 0 THEN ABS(tasd.berat_adjustment) ELSE NULL END::numeric as berat_keluar"),
+    DB::raw('COALESCE(tasd.hpp,0)::numeric as hpp_adj'),
+    DB::raw('COALESCE(tasd.total,0)::numeric as total_adj'),
+    DB::raw('tas.created_at as created_src')
+  )
+  ->where('tas.status','POST');
+
+// --- Gabungan semua transaksi ---
+$allTransaksi = DB::query()
+  ->fromSub($dataPo->unionAll($dataSo)->unionAll($dataAdj), 'history')
+  ->orderBy('created_src','asc')
+  ->orderBy('tanggal','asc')
+  ->get();
+
+// --- Proses kronologis HPP dengan adjustment ---
+$stok=0; $nilai=0; $hpp=0;
+foreach($allTransaksi as $r){
+  $masuk=(float)($r->berat_masuk??0);
+  $keluar=(float)($r->berat_keluar??0);
+  $harga=(float)($r->harga_nett??0);
+  $hppAdj=(float)($r->hpp_adj??0);
+  $totalAdj=(float)($r->total_adj??0);
+  $isAdj=strpos($r->supplier_customer??'','Adjustment')!==false;
+  $hppBefore=$hpp;
+
+  // Masuk normal
+  if(!$isAdj && $masuk>0 && $harga>0){
+    $nilai += $masuk*$harga;
+    $stok  += $masuk;
+    $hpp   = $stok>0?($nilai/$stok):0;
+  }
+
+  // Keluar normal
+  if(!$isAdj && $keluar>0){
+    $nilai -= $keluar*$hppBefore;
+    $stok  -= $keluar;
+    $hpp   = $stok>0?($nilai/$stok):0;
+  }
+
+  // Adjustment
+  if ($isAdj) {
+    $beratPlus  = $masuk;   // adj masuk
+    $beratMinus = $keluar;  // adj keluar
+
+    $isStockOnlyAdjPlus = (
+      $beratPlus > 0 &&
+      (float)$totalAdj == 0.0 &&
+      (float)$hppAdj == 0.0 &&
+      (float)$harga == 0.0
+    );
+
+    $isStockOnlyAdjMinus = (
+      $beratMinus > 0 &&
+      (float)$totalAdj == 0.0 &&
+      (float)$hppAdj == 0.0 &&
+      (float)$harga == 0.0
+    );
+
+    if ($beratPlus > 0) {
+
+      // ✅ stock-only: nilai tidak berubah
+      if ($isStockOnlyAdjPlus) {
+        $stok += $beratPlus;
+      } else {
+        if ($totalAdj > 0)       $nilai += $totalAdj;
+        elseif ($harga > 0)      $nilai += $beratPlus * $harga;
+        else                     $nilai += $beratPlus * $hppBefore;
+
+        $stok += $beratPlus;
+      }
+
+    } elseif ($beratMinus > 0) {
+
+      // ✅ stock-only: nilai tidak berubah
+      if ($isStockOnlyAdjMinus) {
+        $stok -= $beratMinus;
+      } else {
+        if ($totalAdj > 0)       $nilai -= $totalAdj;
+        elseif ($hppAdj > 0)     $nilai -= $beratMinus * $hppAdj;
+        else                     $nilai -= $beratMinus * $hppBefore;
+
+        $stok -= $beratMinus;
+      }
+    }
+
+    $hpp = $stok > 0 ? ($nilai / $stok) : 0;
+  }
+
+}
+
+$hppAkhir = round($hpp);
+$totalBalance = $stok;
+$totalBalanceRp = $nilai;
+
+// --- Ambil stok real per kavling ---
+$rawData = DB::table('m_range as mr')
+  ->leftJoin('m_gudang_d_range as mgdr','mgdr.m_range_id','=','mr.id')
+  ->leftJoin('m_gudang_d as mgd','mgd.id','=','mgdr.m_gudang_d_id')
+  ->leftJoin('m_gudang as mg','mg.id','=','mgd.m_gudang_id')
+  ->select(
+    'mr.nama as nama_range',
+    'mg.nama as nama_gudang',
+    'mgd.nama as nama_kavling',
+    DB::raw('GREATEST(mgdr.stok,0) as stok')
+  )
+  ->orderBy('mr.nama')->orderBy('mg.nama')->orderBy('mgd.nama')
+  ->get();
+
+// --- Sinkronisasi total stok ---
+$sumCurrent = (float)$rawData->sum('stok');
+if ($sumCurrent > 0 && abs($sumCurrent - $totalBalance) > 0.001) {
+  $ratio = $totalBalance / $sumCurrent;
+  $rawData = $rawData->map(function($r) use($ratio){
+    $r->stok = round($r->stok * $ratio, 3);
+    return $r;
+  });
+}
+
+// --- Hitung total Rp per kavling ---
+$rawData = $rawData->map(function($r) use($hppAkhir){
+  $r->total_rp = $r->stok * $hppAkhir;
+  return $r;
+});
+
+// --- Koreksi total Rp ---
+$sumRp = $rawData->sum('total_rp');
+$diffRp = $totalBalanceRp - $sumRp;
+if (abs($diffRp) >= 1 && $rawData->count() > 0) {
+  $last = $rawData->last();
+  $last->total_rp += $diffRp;
+  $rawData[$rawData->keys()->last()] = $last;
+}
+
+// ✅ Samakan dengan laporan HPP: saldo nilai akhir
+$stockGudang = round($totalBalanceRp);
+
+// =========================================================
+// 3️⃣ PEMBELIAN NON-TRADING (DISESUAIKAN DENGAN HPP TOTAL MASUK + ADJ MASUK)
+// =========================================================
+$aggPiDetailNT = DB::table('t_pi_bahan_d as tpid')
+  ->select('tpid.t_penerimaan_id', DB::raw('AVG(tpid.harga_nett) AS avg_harga_nett'))
+  ->groupBy('tpid.t_penerimaan_id');
+
+// --- total dari penerimaan (PO non-trading) ---
+$pembelianNonTrading = DB::table('t_penerimaan as tp')
+  ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+  ->leftJoinSub($aggPiDetailNT,'pid',fn($j)=>$j->on('pid.t_penerimaan_id','=','tp.id'))
+  ->where('tp.status','POST')
+  ->where(fn($w)=>$w->where('tpo.is_trading',false)->orWhereNull('tpo.is_trading'))
+  ->when($periodeFrom && $periodeTo,fn($q)=>$q->whereBetween('tp.tgl_penerimaan',[$periodeFrom,$periodeTo]))
+  ->select(DB::raw('COALESCE(SUM(tp.total_netto * COALESCE(pid.avg_harga_nett, tpo.harga_sepakat, 0)),0)::numeric as total_nett'))
+  ->value('total_nett');
+
+// --- tambahkan adjustment masuk (berat_adjustment > 0) ---
+$adjMasuk = DB::table('t_adjustment_stock as tas')
+  ->join('t_adjustment_stock_d as tasd','tasd.t_adjustment_stock_id','=','tas.id')
+  ->where('tas.status','POST')
+  ->where('tasd.berat_adjustment','>',0)
+  ->select(DB::raw('COALESCE(SUM(tasd.berat_adjustment * COALESCE(tasd.harga_nett, tasd.hpp, 0)),0)::numeric as total_adj'))
+  ->value('total_adj');
+
+// total akhir = penerimaan + adjustment positif
+$pembelianNonTrading = round((float)$pembelianNonTrading + (float)$adjMasuk);
+
+// =========================================================
+// 4️⃣ PEMBELIAN TRADING
+// =========================================================
+$pembelianTrading=(float)DB::table('t_pi_bahan as pib')
+  ->join('t_po_bahan as po','po.id','=','pib.t_po_bahan_id')
+  ->where('pib.status','POST')
+  ->where('po.is_trading',true)
+  ->when($periodeFrom && $periodeTo,fn($q)=>$q->whereBetween('pib.tgl_pi',[$periodeFrom,$periodeTo]))
+  ->sum('pib.grand_total');
+
+// =========================================================
+// 5️⃣ BIAYA USAHA (DINAMIS DARI m_coa)
+// =========================================================
+$excludeCoa = ['Pembelian', 'Pembelian Trading'];
+
+$biayaCoaList = DB::table('m_coa')
+  ->whereNotNull('nama_coa')
+  ->whereNotIn('nama_coa', $excludeCoa) // ✅ buang dari list biaya usaha
+  ->orderBy('nama_coa')
+  ->pluck('nama_coa')
+  ->toArray();
+
+$biayaRows = DB::table('t_pengeluaran_kas as pk')   // ✅ ubah ke t_pengeluaran_kas
+  ->join('m_coa as coa','coa.id','=','pk.m_coa_id')
+  ->where('pk.status','POST')
+  ->when($periodeFrom && $periodeTo, fn($q)=>$q->whereBetween('pk.tgl',[$periodeFrom,$periodeTo]))
+  ->whereIn('coa.nama_coa',$biayaCoaList)
+  ->select('coa.nama_coa', DB::raw('SUM(COALESCE(pk.jumlah,0)) as total'))
+  ->groupBy('coa.nama_coa')
+  ->pluck('total','coa.nama_coa')
+  ->toArray();
+
+$biayaUsaha = [];
+$totalBiaya = 0;
+foreach ($biayaCoaList as $coaNama) {
+  $val = (float)($biayaRows[$coaNama] ?? 0);
+  $biayaUsaha[] = [
+    'label' => $coaNama,
+    'total' => $val,
+  ];
+  $totalBiaya += $val;
+}
+
+// =========================================================
+// 6️⃣ LABA / RUGI
+// =========================================================
+$labaBruto=$penjualan+$stockGudang-($pembelianNonTrading+$pembelianTrading);
+$labaBersih=$labaBruto-$totalBiaya;
+@endphp
+
+<div style="text-align:center;margin-bottom:10px;">
+  <h3 style="margin:0;font-weight:bold;">LAPORAN LABA RUGI</h3>
+  <p style="margin:0;">
+    Periode:
+    {{ $periodeFrom ? $helper->formatDateId($periodeFrom) : '-' }}
+    {{ $periodeTo ? ' s/d '.$helper->formatDateId($periodeTo) : '' }}
+  </p>
+</div>
+
+<table style="width:100%;border-collapse:collapse;font-size:12px;">
+  <tbody>
+    <tr>
+      <td style="border:1px solid #000;padding:6px;">Penjualan</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+        {{ $isExcelExport ? $fmtExportPlain($penjualan) : $fmtBrowser($penjualan) }}
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:6px;">Stock Gudang</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+        {{ $isExcelExport ? $fmtExportPlain($stockGudang) : $fmtBrowser($stockGudang) }}
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:6px;">Pembelian CV Tofan</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+        {{ $isExcelExport ? $fmtExportPlain($pembelianNonTrading) : $fmtBrowser($pembelianNonTrading) }}
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:6px;">Pembelian Trading</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+        {{ $isExcelExport ? $fmtExportPlain($pembelianTrading) : $fmtBrowser($pembelianTrading) }}
+      </td>
+    </tr>
+    <tr style="font-weight:bold;background:#fff8c4;">
+      <td style="border:1px solid #000;padding:6px;">Laba Bruto</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : $negStyle($labaBruto) }}">
+        {{ $isExcelExport ? $fmtExportPlain($labaBruto) : $fmtBrowserNoParen($labaBruto) }}
+      </td>
+    </tr>
+    <tr>
+      <td colspan="2" style="border:1px solid #000;padding:6px;font-weight:bold;">Biaya Usaha:</td>
+    </tr>
+    @foreach ($biayaUsaha as $b)
+      <tr>
+        <td style="border:1px solid #000;padding:6px;">{{ $b['label'] }}</td>
+        <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($b['total']) : $fmtBrowser($b['total']) }}
+        </td>
+      </tr>
+    @endforeach
+    <tr style="font-weight:bold;">
+      <td style="border:1px solid #000;padding:6px;">Total Biaya</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+        {{ $isExcelExport ? $fmtExportPlain($totalBiaya) : $fmtBrowser($totalBiaya) }}
+      </td>
+    </tr>
+    <tr style="font-weight:bold;background:#fff8c4;">
+      <td style="border:1px solid #000;padding:6px;">Laba Bersih Sebelum Pajak</td>
+      <td style="border:1px solid #000;padding:6px;text-align:right;{{ $isExcelExport ? $cellNumberStyle : $negStyle($labaBersih) }}">
+        {{ $isExcelExport ? $fmtExportPlain($labaBersih) : $fmtBrowserNoParen($labaBersih) }}
+      </td>
+    </tr>
+  </tbody>
+</table>

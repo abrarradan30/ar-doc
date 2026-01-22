@@ -1,0 +1,35 @@
+-- Data 1: Sesuai kondisi 1 (Tanggal Gadai 14 Agustus 2025)
+INSERT INTO m_transactions (
+    id, "no_SBG", "IMEI", status, body_photo, display_photo, equipment_photo, check_photo, noted, reject_reason, time_approval, time_pencairan, kasir, jatuh_tempo, "createdAt", "updatedAt", f_product_cat_code, f_outlet_code, f_segments, f_brands, f_grades, f_customers, f_jaminan, f_company, f_types, f_area_code, f_data_pinjaman, f_log_transactions, f_reject_reasons, f_log_void, doc1_doc, doc2_doc, doc3_doc, jenis_pembayaran, f_categories, status_pinjaman, time_status_pinjaman, status_approval, status_pencairan, is_read, read_notif, "read"
+) VALUES (
+    'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'SBG/MERDEKA/250829/003', '358320681612132', '0', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', NULL, NULL, '2025-08-14T10:05:00Z', '2025-08-14T10:10:00Z', NULL, '2025-09-14 17:00:00', '2025-08-14 10:00:00.000 +0700', '2025-08-14 10:10:00.000 +0700', 'e17473ad-e6ad-41f7-bd48-9f8f98292d87', '4ecd471f-9d60-423a-ade6-bfd994cc052f', '77b690b4-290d-43bf-88a7-bb9ae162c278', '5106d4e3-95f5-4dc5-ba56-dddd306440ee', '40f09d66-4608-4e82-a049-5a80514d796b', '38430a25-709c-4c2b-8d42-3dab4225441c', 'f0e1d2c3-b4a5-6789-0123-456789abcdef', 'efeec6eb-22d9-4fe7-9096-f8dd18b764d9', 'bc8b37d8-9bc9-44f8-a260-d382a91e900f', '7c122a02-4387-4856-bd8b-34986f277168', '267c5dbe-285e-497b-ba8c-a0a904fd1a2e', NULL, NULL, NULL, 'uploads/sample.jpg', NULL, NULL, 'tunai', '08428634-2fab-420f-9ad0-608298cb4dd1', NULL, '2025-08-14T10:05:00Z', '2', '1', false, false, 0
+);
+
+-- Data 2: Sesuai kondisi 2 (Tanggal Gadai 13 Agustus 2025 & Jatuh Tempo 28 Agustus 2025)
+INSERT INTO m_transactions (
+    id, "no_SBG", "IMEI", status, body_photo, display_photo, equipment_photo, check_photo, noted, reject_reason, time_approval, time_pencairan, kasir, jatuh_tempo, "createdAt", "updatedAt", f_product_cat_code, f_outlet_code, f_segments, f_brands, f_grades, f_customers, f_jaminan, f_company, f_types, f_area_code, f_data_pinjaman, f_log_transactions, f_reject_reasons, f_log_void, doc1_doc, doc2_doc, doc3_doc, jenis_pembayaran, f_categories, status_pinjaman, time_status_pinjaman, status_approval, status_pencairan, is_read, read_notif, "read"
+) VALUES (
+    'b2c3d4e5-f6a7-8901-2345-67890abcdef1', 'SBG/MERDEKA/250829/004', '358320681612133', '2', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', NULL, NULL, '2025-08-13T11:05:00Z', '2025-08-13T11:10:00Z', NULL, '2025-08-28 18:00:00', '2025-08-13 11:00:00.000 +0700', '2025-08-13 11:10:00.000 +0700', 'e17473ad-e6ad-41f7-bd48-9f8f98292d87', '4ecd471f-9d60-423a-ade6-bfd994cc052f', '77b690b4-290d-43bf-88a7-bb9ae162c278', '5106d4e3-95f5-4dc5-ba56-dddd306440ee', '40f09d66-4608-4e82-a049-5a80514d796b', '12345678-1234-1234-1234-1234567890ab', 'e1d2c3b4-a5f6-7890-1234-567890abcdef', 'efeec6eb-22d9-4fe7-9096-f8dd18b764d9', 'bc8b37d8-9bc9-44f8-a260-d382a91e900f', '7c122a02-4387-4856-bd8b-34986f277168', '267c5dbe-285e-497b-ba8c-a0a904fd1a2e', NULL, NULL, NULL, 'uploads/sample.jpg', NULL, NULL, 'tunai', '08428634-2fab-420f-9ad0-608298cb4dd1', NULL, '2025-08-13T11:05:00Z', '2', '1', false, false, 0
+);
+
+-- Data 3: Sesuai kondisi 3 (Jatuh Tempo 25 Agustus 2025)
+INSERT INTO m_transactions (
+    id, "no_SBG", "IMEI", status, body_photo, display_photo, equipment_photo, check_photo, noted, reject_reason, time_approval, time_pencairan, kasir, jatuh_tempo, "createdAt", "updatedAt", f_product_cat_code, f_outlet_code, f_segments, f_brands, f_grades, f_customers, f_jaminan, f_company, f_types, f_area_code, f_data_pinjaman, f_log_transactions, f_reject_reasons, f_log_void, doc1_doc, doc2_doc, doc3_doc, jenis_pembayaran, f_categories, status_pinjaman, time_status_pinjaman, status_approval, status_pencairan, is_read, read_notif, "read"
+) VALUES (
+    'a1f5d67c-3e82-4a21-babc-97a3b7ef2c11', 'SBG/MERDEKA/250829/005', '358320681612134', '3', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', NULL, NULL, '2025-07-25T14:05:00Z', '2025-07-25T14:10:00Z', NULL, '2025-08-25 12:00:00', '2025-07-25 14:00:00.000 +0700', '2025-07-25 14:10:00.000 +0700', 'e17473ad-e6ad-41f7-bd48-9f8f98292d87', '4ecd471f-9d60-423a-ade6-bfd994cc052f', '77b690b4-290d-43bf-88a7-bb9ae162c278', '5106d4e3-95f5-4dc5-ba56-dddd306440ee', '40f09d66-4608-4e82-a049-5a80514d796b', '38430a25-709c-4c2b-8d42-3dab4225441c', 'd2c3b4a5-f6e7-8901-2345-67890abcdef0', 'efeec6eb-22d9-4fe7-9096-f8dd18b764d9', 'bc8b37d8-9bc9-44f8-a260-d382a91e900f', '7c122a02-4387-4856-bd8b-34986f277168', '267c5dbe-285e-497b-ba8c-a0a904fd1a2e', NULL, NULL, NULL, 'uploads/sample.jpg', NULL, NULL, 'tunai', '08428634-2fab-420f-9ad0-608298cb4dd1', NULL, '2025-07-25T14:05:00Z', '2', '1', false, false, 0
+);
+
+-- Data 4: Sesuai kondisi 4 (Jatuh Tempo 13 Agustus 2025)
+INSERT INTO m_transactions (
+    id, "no_SBG", "IMEI", status, body_photo, display_photo, equipment_photo, check_photo, noted, reject_reason, time_approval, time_pencairan, kasir, jatuh_tempo, "createdAt", "updatedAt", f_product_cat_code, f_outlet_code, f_segments, f_brands, f_grades, f_customers, f_jaminan, f_company, f_types, f_area_code, f_data_pinjaman, f_log_transactions, f_reject_reasons, f_log_void, doc1_doc, doc2_doc, doc3_doc, jenis_pembayaran, f_categories, status_pinjaman, time_status_pinjaman, status_approval, status_pencairan, is_read, read_notif, "read"
+) VALUES (
+    'd4e5f6a7-b8c9-0123-4567-890abcdef123', 'SBG/MERDEKA/250829/006', '358320681612135', '3', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', 'uploads/sample.png', NULL, NULL, '2025-07-13T15:05:00Z', '2025-07-13T15:10:00Z', NULL, '2025-08-13 09:00:00', '2025-07-13 15:00:00.000 +0700', '2025-07-13 15:10:00.000 +0700', 'e17473ad-e6ad-41f7-bd48-9f8f98292d87', '4ecd471f-9d60-423a-ade6-bfd994cc052f', '77b690b4-290d-43bf-88a7-bb9ae162c278', '5106d4e3-95f5-4dc5-ba56-dddd306440ee', '40f09d66-4608-4e82-a049-5a80514d796b', '12345678-1234-1234-1234-1234567890ab', 'c63f4a19-9d80-4076-83f6-3f4eeb9a7c8f', 'efeec6eb-22d9-4fe7-9096-f8dd18b764d9', 'bc8b37d8-9bc9-44f8-a260-d382a91e900f', '7c122a02-4387-4856-bd8b-34986f277168', '267c5dbe-285e-497b-ba8c-a0a904fd1a2e', NULL, NULL, NULL, 'uploads/sample.jpg', NULL, NULL, 'tunai', '08428634-2fab-420f-9ad0-608298cb4dd1', NULL, '2025-07-13T15:05:00Z', '2', '1', false, false, 0
+);
+
+
+1. tanggal 14 agustus (15 hari)  => 5%. 'SBG/MERDEKA/250829/001'
+2. tanggal 13 agustus(16 hari) & tanggal jatuh temponya tanggal 28 agustus => 10% (SBG/MERDEKA/250829/002)
+3. tanggal jatuh tempo  tanggal 25 agustus(3 hari lewat Jatuh Tempo) 17% (SBG/MERDEKA/250829/003)
+4. tanggal jatuh tempo tanggal 13 agustus(16 hari dari Jatuh Tempo) => 22% (SBG/MERDEKA/250829/004)
+
+SELECT * FROM m_transactions WHERE "no_SBG" LIKE '%SBG/MERDEKA/250829%';

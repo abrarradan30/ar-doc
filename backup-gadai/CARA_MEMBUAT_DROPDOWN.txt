@@ -1,0 +1,13 @@
+Sorry, pembuatan file .xlsx dengan data validation (dropdown) otomatis hanya bisa dilakukan dengan library Python seperti openpyxl/xlsxwriter atau script khusus, yang tidak bisa dijalankan langsung di sini. Namun, berikut langkah manual yang bisa Anda lakukan di Excel:
+
+1. Buka file .xlsx yang sudah ada list-nya.
+2. Blok seluruh list pilihan (misal B2:B100).
+3. Beri nama range, misal: PilihanDropdown.
+4. Di kolom A (atau kolom yang diinginkan), blok sel yang ingin diberi dropdown.
+5. Pilih menu Data > Data Validation > List.
+6. Pada Source, ketik: =PilihanDropdown
+7. Klik OK.
+
+Sekarang kolom A sudah menjadi dropdown dari list yang Anda punya.
+
+Jika ingin script Python untuk generate file .xlsx dengan dropdown otomatis, saya bisa buatkan kodenya untuk Anda jalankan di komputer lokal.
