@@ -1,0 +1,1291 @@
+public function custom_recalculateKartuStok($req)
+{
+    $param = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+
+    if (empty($itemIds) || !is_array($itemIds)) {
+        return response()->json(
+            [
+                "success" => false,
+                "message" =>
+                    "Parameter 'm_item_id' wajib diisi (boleh 1 id atau array id item).",
+            ],
+            422
+        );
+    }
+
+    $itemIds = array_filter(
+        array_map("intval", $itemIds),
+        fn($v) => $v > 0
+    );
+    if (empty($itemIds)) {
+        return response()->json(
+            [
+                "success" => false,
+                "message" =>
+                    "Semua nilai 'm_item_id' harus numerik dan > 0.",
+            ],
+            422
+        );
+    }
+
+    \DB::beginTransaction();
+    try {
+        $updatedCount = 0;
+        $affectedPairs = [];
+
+        // Ambil semua kombinasi item + gudang
+        $targets = \DB::table("kartu_stok")
+            ->whereIn("m_item_id", $itemIds)
+            ->select("m_item_id", "m_gudang_id")
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $target) {
+            $itemId = (int) $target->m_item_id;
+            $gudangId = (int) $target->m_gudang_id;
+
+            // 🔄 Urutkan berdasar kronologi sistem sebenarnya (waktu input)
+            $rows = \DB::table("kartu_stok")
+                ->where("m_item_id", $itemId)
+                ->where("m_gudang_id", $gudangId)
+                ->orderBy("created_at") // gunakan waktu posting
+                ->orderBy("id")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            // Mulai dari saldo awal sebelum transaksi pertama
+            $saldo =
+                (float) (\DB::table("kartu_stok")
+                    ->where("m_item_id", $itemId)
+                    ->where("m_gudang_id", $gudangId)
+                    ->where("created_at", "<", $rows->first()->created_at)
+                    ->orderBy("created_at", "desc")
+                    ->orderBy("id", "desc")
+                    ->value("saldo_akhir") ?? 0);
+
+            foreach ($rows as $r) {
+                $awal = $saldo;
+                $akhir =
+                    $awal +
+                    (float) ($r->qty_masuk ?? 0) -
+                    (float) ($r->qty_keluar ?? 0);
+
+                \DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal" => $awal,
+                        "saldo_akhir" => $akhir,
+                        "updated_at" => \Carbon\Carbon::now(),
+                    ]);
+
+                $saldo = $akhir;
+                $updatedCount++;
+            }
+
+            $affectedPairs[] = [
+                "m_item_id" => $itemId,
+                "m_gudang_id" => $gudangId,
+                "final_saldo" => $saldo,
+            ];
+        }
+
+        \DB::commit();
+        return response()->json([
+            "success" => true,
+            "message" => "Recalculate kartu stok selesai.",
+            "updated_rows" => $updatedCount,
+            "affected_items" => $itemIds,
+            "affected_pairs" => $affectedPairs,
+        ]);
+    } catch (\Throwable $e) {
+        \DB::rollBack();
+        \Log::error("custom_recalculateKartuStok gagal", [
+            "items" => $itemIds,
+            "error" => $e->getMessage(),
+        ]);
+        return response()->json(
+            [
+                "success" => false,
+                "message" => $e->getMessage(),
+            ],
+            500
+        );
+    }
+}
+
+public function custom_recalculateItemStokHPP($req)
+{
+    // ==========================
+    // 1. CUSTOM ROUND (3 decimal)
+    // ==========================
+    if (!function_exists("customRound3")) {
+        function customRound3($value)
+        {
+            $mult    = 1000;
+            $scaled  = $value * $mult;
+            $floor   = floor($scaled);
+            $decimal = $scaled - $floor;
+
+            if ($decimal >= 0.6) {
+                return ($floor + 1) / $mult;
+            }
+            return $floor / $mult;
+        }
+    }
+
+    $param   = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+    $itemIds = array_filter(array_map("intval", $itemIds));
+
+    if (empty($itemIds)) {
+        return response()->json([
+            "success" => false,
+            "message" => "Parameter m_item_id wajib diisi",
+        ], 422);
+    }
+
+    DB::beginTransaction();
+    try {
+        $affected     = [];
+        $totalUpdated = 0;
+
+        // ==========================
+        // AMBIL ITEM + GUDANG
+        // ==========================
+        $targets = DB::table("kartu_stok")
+            ->select("m_item_id", "m_gudang_id")
+            ->whereIn("m_item_id", $itemIds)
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $tg) {
+
+            $item = (int) $tg->m_item_id;
+            $gd   = (int) $tg->m_gudang_id;
+
+            // ==========================
+            // AMBIL KARTU STOK BERURUTAN
+            // ==========================
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("created_at", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            $first = $rows->first();
+
+            // ==========================
+            // SALDO & HPP SEBELUMNYA
+            // ==========================
+            $prevData = DB::table("kartu_stok")
+                ->select("saldo_akhir", "harga_pokok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->where(function ($q) use ($first) {
+                    $q->where("date_trx", "<", $first->date_trx)
+                        ->orWhere(function ($q2) use ($first) {
+                            $q2->where("date_trx", "=", $first->date_trx)
+                                ->where(function ($q3) use ($first) {
+                                    $q3->where("created_at", "<", $first->created_at)
+                                        ->orWhere(function ($q4) use ($first) {
+                                            $q4->where("created_at", "=", $first->created_at)
+                                                ->where("id", "<", $first->id);
+                                        });
+                                });
+                        });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("created_at", "desc")
+                ->orderBy("id", "desc")
+                ->first();
+
+            $saldo  = $prevData ? (float) $prevData->saldo_akhir : 0;
+            $hppNow = $prevData ? (float) $prevData->harga_pokok : 0;
+
+            // ==========================
+            // REFERENSI BATCH
+            // ==========================
+            $batchTables = [
+                "t_pres",
+                "t_adj",
+                "t_batch_merge",
+                "t_penerimaan",
+                "t_po_bahan",
+                "t_rp"
+            ];
+
+            // ==========================
+            // LOOP KARTU STOK
+            // ==========================
+            foreach ($rows as $r) {
+
+                $qtyMasuk  = (float) ($r->qty_masuk ?? 0);
+                $qtyKeluar = (float) ($r->qty_keluar ?? 0);
+                $saldoAwal = $saldo;
+                $isPending = (bool) ($r->pending ?? false);
+                $tableRef  = trim((string) $r->referensi_table);
+
+                // ==========================
+                // TRANSAKSI MASUK
+                // ==========================
+                if ($r->tipe_transaksi === "MASUK") {
+
+                    $saldo = $saldoAwal + $qtyMasuk;
+
+                    $isBatchMasuk = in_array($tableRef, $batchTables);
+
+                    // Tentukan harga masuk
+                    if ($isBatchMasuk) {
+                        $hargaMasuk = (float) $r->harga_sak;
+                        if ($hargaMasuk <= 0) {
+                            $hargaMasuk = (float) $r->harga_pokok;
+                        }
+                    } else {
+                        $hargaMasuk = (float) $r->harga_pokok > 0
+                            ? (float) $r->harga_pokok
+                            : $hppNow;
+                    }
+
+                    // ==========================
+                    // KALKULASI HPP
+                    // ==========================
+                    if ($saldo > 0) {
+
+                        if ($isPending) {
+                            // PENDING MASUK
+                            // HPP TIDAK BERUBAH (ESTIMASI)
+                            // $hppNow tetap
+                        } else {
+                            // FINAL MASUK
+                            if ($saldoAwal <= 0) {
+                                $hppNow = customRound3($hargaMasuk);
+                            } else {
+                                $nilaiStokLama = $saldoAwal * $hppNow;
+                                $nilaiStokBaru = $qtyMasuk * $hargaMasuk;
+
+                                $hppNow = customRound3(
+                                    ($nilaiStokLama + $nilaiStokBaru) / $saldo
+                                );
+                            }
+                        }
+                    }
+
+                } else {
+                    // ==========================
+                    // TRANSAKSI KELUAR
+                    // ==========================
+                    $saldo = $saldoAwal - $qtyKeluar;
+                    // HPP TIDAK BERUBAH
+                }
+
+                // ==========================
+                // UPDATE DATABASE
+                // ==========================
+                DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal"  => $saldoAwal,
+                        "saldo_akhir" => $saldo,
+                        "harga_pokok" => $hppNow,
+                        "updated_at"  => \Carbon\Carbon::now(),
+                    ]);
+
+                $totalUpdated++;
+            }
+
+            $affected[] = [
+                "m_item_id"   => $item,
+                "m_gudang_id" => $gd,
+                "final_saldo" => $saldo,
+                "final_hpp"   => $hppNow,
+            ];
+        }
+
+        DB::commit();
+
+        return response()->json([
+            "success"  => true,
+            "updated"  => $totalUpdated,
+            "affected" => $affected,
+        ]);
+
+    } catch (\Throwable $e) {
+        DB::rollBack();
+
+        return response()->json([
+            "success" => false,
+            "message" => $e->getMessage(),
+            "line"    => $e->getLine(),
+            "file"    => $e->getFile(),
+        ], 500);
+    }
+}
+
+public function custom_recalculateItemStokHPP_NoPending($req)
+{
+    // ==========================
+    // 1. CUSTOM ROUND (3 decimal)
+    // ==========================
+    if (!function_exists("customRound3")) {
+        function customRound3($value)
+        {
+            $mult = 1000;
+            $scaled = $value * $mult;
+            $floor = floor($scaled);
+            $decimal = $scaled - $floor;
+
+            if ($decimal >= 0.6) {
+                return ($floor + 1) / $mult;
+            } else {
+                return $floor / $mult;
+            }
+        }
+    }
+
+    $param = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+
+    if (empty($itemIds)) {
+        return response()->json([
+            "success" => false,
+            "message" => "Parameter m_item_id wajib diisi",
+        ], 422);
+    }
+
+    $itemIds = array_filter(array_map("intval", $itemIds));
+
+    DB::beginTransaction();
+    try {
+        $affected = [];
+        $totalUpdated = 0;
+
+        $targets = DB::table("kartu_stok")
+            ->select("m_item_id", "m_gudang_id")
+            ->whereIn("m_item_id", $itemIds)
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $tg) {
+            $item = (int) $tg->m_item_id;
+            $gd = (int) $tg->m_gudang_id;
+
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("created_at", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            $first = $rows->first();
+
+            // Ambil Saldo & HPP Awal (Initial State)
+            $prevData = DB::table("kartu_stok")
+                ->select("saldo_akhir", "harga_pokok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->where(function ($q) use ($first) {
+                    $q->where("date_trx", "<", $first->date_trx)
+                        ->orWhere(function ($q2) use ($first) {
+                            $q2->where("date_trx", "=", $first->date_trx)
+                                ->where(function ($q3) use ($first) {
+                                    $q3->where("created_at", "<", $first->created_at)
+                                        ->orWhere(function ($q4) use ($first) {
+                                            $q4->where("created_at", "=", $first->created_at)
+                                                ->where("id", "<", $first->id);
+                                        });
+                                });
+                        });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("created_at", "desc")
+                ->orderBy("id", "desc")
+                ->first();
+
+            $saldo  = $prevData ? (float) $prevData->saldo_akhir : 0;
+            $hppNow = $prevData ? (float) $prevData->harga_pokok : 0;
+
+            // Definisikan tabel batch yang valid
+            $batchTables = [
+                "t_pres", "t_adj", "t_batch_merge",
+                "t_penerimaan", "t_po_bahan", "t_rp"
+            ];
+
+            foreach ($rows as $r) {
+                // Konversi float untuk keamanan kalkulasi
+                $qtyMasuk  = (float) ($r->qty_masuk ?? 0);
+                $qtyKeluar = (float) ($r->qty_keluar ?? 0);
+                
+                // Saldo Awal transaksi ini = Saldo Akhir loop sebelumnya
+                $saldoAwal = $saldo; 
+                $tableRef  = trim($r->referensi_table);
+
+                if ($r->tipe_transaksi === "MASUK") {
+                    // ==========================
+                    // LOGIKA MASUK
+                    // ==========================
+                    $saldo = $saldoAwal + $qtyMasuk;
+                    // Mencegah saldo negatif float
+                    // if ($saldo < 0) $saldo = 0; 
+
+                    $isBatchMasuk = in_array($tableRef, $batchTables);
+
+                    // Tentukan Harga Beli Transaksi Ini
+                    $hargaMasuk = 0;
+                    if ($isBatchMasuk) {
+                        // Jika Batch, prioritas harga_sak, lalu harga_pokok
+                        $hargaMasuk = (float) $r->harga_sak;
+                        if ($hargaMasuk <= 0) $hargaMasuk = (float) $r->harga_pokok;
+                    } else {
+                        // Jika Retur/Lainnya non-batch, gunakan HPP berjalan jika tidak ada harga spesifik
+                        $hargaMasuk = (float) $r->harga_pokok > 0 ? (float)$r->harga_pokok : $hppNow;
+                    }
+
+                    // ==========================
+                    // CORE FIX: KALKULASI HPP
+                    // ==========================
+                    if ($saldo > 0) {
+                        if ($saldoAwal <= 0) {
+                            // 1. Jika stok sebelumnya habis/0, HPP di-reset mengikuti harga masuk baru
+                            $hppNow = customRound3($hargaMasuk);
+                        } else {
+                            // 2. Jika stok ada, lakukan Rata-rata Tertimbang (Weighted Average)
+                            // Rumus: ((SaldoLama * HppLama) + (QtyMasuk * HargaMasuk)) / TotalSaldo
+                            
+                            $nilaiStokLama = $saldoAwal * $hppNow;
+                            $nilaiStokBaru = $qtyMasuk * $hargaMasuk;
+                            
+                            $hppNow = customRound3(($nilaiStokLama + $nilaiStokBaru) / $saldo);
+                        }
+                    } 
+                    // Jika saldo 0 atau negatif setelah masuk (kasus aneh), HPP tetap/reset
+
+                } else {
+                    // ==========================
+                    // LOGIKA KELUAR
+                    // ==========================
+                    $saldo = $saldoAwal - $qtyKeluar;
+                    // if ($saldo < 0) $saldo = 0;
+                    
+                    // Saat barang keluar, HPP TIDAK BERUBAH (tetap memakai $hppNow terakhir)
+                }
+
+                // Update Database
+                DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal"  => $saldoAwal,
+                        "saldo_akhir" => $saldo,
+                        "harga_pokok" => $hppNow,
+                        "updated_at"  => \Carbon\Carbon::now(),
+                    ]);
+
+                $totalUpdated++;
+            }
+
+            $affected[] = [
+                "m_item_id"   => $item,
+                "m_gudang_id" => $gd,
+                "final_saldo" => $saldo,
+                "final_hpp"   => $hppNow,
+            ];
+        }
+
+        DB::commit();
+
+        return response()->json([
+            "success" => true,
+            "updated" => $totalUpdated,
+            "affected" => $affected,
+        ]);
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        return response()->json([
+            "success" => false,
+            "message" => "Error: " . $e->getMessage(),
+            "line"    => $e->getLine(),
+            "file"    => $e->getFile()
+        ], 500);
+    }
+}
+
+public function custom_recalculateItemStokHPPBCKP3($req)
+{
+    // ==========================
+    // 1. CUSTOM ROUND (3 decimal)
+    // ==========================
+    if (!function_exists("customRound3")) {
+        function customRound3($value)
+        {
+            $mult = 1000;
+            // Gunakan string formatting/multiplikasi
+            $scaled = $value * $mult;
+            
+            // FIX: Harus pakai floor() eksplisit agar menjadi integer bawah
+            $floor = floor($scaled);
+            $decimal = $scaled - $floor;
+
+            // Logika: 0.6 ke atas naik (ceil), di bawah itu turun (floor)
+            if ($decimal >= 0.6) {
+                return ($floor + 1) / $mult;
+            } else {
+                return $floor / $mult;
+            }
+        }
+    }
+
+    $param = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+
+    if (empty($itemIds)) {
+        return response()->json([
+            "success" => false,
+            "message" => "Parameter m_item_id wajib diisi",
+        ], 422);
+    }
+
+    // Sanitasi
+    $itemIds = array_filter(array_map("intval", $itemIds));
+
+    DB::beginTransaction();
+    try {
+        $affected = [];
+        $totalUpdated = 0;
+
+        // Ambil kombinasi item + gudang unik
+        $targets = DB::table("kartu_stok")
+            ->select("m_item_id", "m_gudang_id")
+            ->whereIn("m_item_id", $itemIds)
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $tg) {
+            $item = (int) $tg->m_item_id;
+            $gd = (int) $tg->m_gudang_id;
+
+            // Ambil data kronologis (Pastikan urutan ID benar jika tanggal sama)
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("created_at", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            // Ambil Initial State sebelum transaksi pertama di range
+            $first = $rows->first();
+            
+            // Query Saldo Awal (sebelum range)
+            $prevSaldo = (float) DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->where(function ($q) use ($first) {
+                    $q->where("date_trx", "<", $first->date_trx)
+                    ->orWhere(function ($q2) use ($first) {
+                        $q2->where("date_trx", "=", $first->date_trx)
+                            ->where(function ($q3) use ($first) {
+                                $q3->where("created_at", "<", $first->created_at)
+                                    ->orWhere(function ($q4) use ($first) {
+                                        $q4->where("created_at", "=", $first->created_at)
+                                        ->where("id", "<", $first->id);
+                                    });
+                            });
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("created_at", "desc")
+                ->orderBy("id", "desc")
+                ->value("saldo_akhir") ?? 0;
+
+            // Query HPP Awal (sebelum range)
+            $prevHpp = (float) DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->where(function ($q) use ($first) {
+                    $q->where("date_trx", "<", $first->date_trx)
+                    ->orWhere(function ($q2) use ($first) {
+                        $q2->where("date_trx", "=", $first->date_trx)
+                            ->where(function ($q3) use ($first) {
+                                $q3->where("created_at", "<", $first->created_at)
+                                    ->orWhere(function ($q4) use ($first) {
+                                        $q4->where("created_at", "=", $first->created_at)
+                                        ->where("id", "<", $first->id);
+                                    });
+                            });
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("created_at", "desc")
+                ->orderBy("id", "desc")
+                ->value("harga_pokok") ?? 0;
+
+            // ==========================
+            // STATE CALCULATOR
+            // ==========================
+            $saldo = $prevSaldo;
+            $hppNow = $prevHpp;
+            
+            // State untuk rumus 2-Batch
+            $lastQtyIn = 0.0;
+            $lastHarga = 0.0;
+            $hasLastIn = false; 
+
+            // Definisikan tabel batch yang valid
+            $batchTables = [
+                "t_pres", "t_adj", "t_batch_merge", 
+                "t_penerimaan", "t_po_bahan", "t_rp"
+            ];
+
+            foreach ($rows as $r) {
+                $qtyMasuk = (float) ($r->qty_masuk ?? 0);
+                $qtyKeluar = (float) ($r->qty_keluar ?? 0);
+                $saldoAwal = $saldo;
+                $tableRef = trim($r->referensi_table); 
+
+                if ($r->tipe_transaksi === "MASUK") {
+                    // ==========================
+                    // LOGIKA MASUK
+                    // ==========================
+                    $saldo = $saldoAwal + $qtyMasuk;
+                    if ($saldo < 0) $saldo = 0;
+
+                    $isBatchMasuk = in_array($tableRef, $batchTables);
+
+                    if ($isBatchMasuk) {
+
+                        $hargaBatch = (float) $r->harga_sak;
+                        if ($hargaBatch <= 0) {
+                            $hargaBatch = (float) $r->harga_pokok;
+                        }
+
+                        // ==========================
+                        // 🔥 FIX RESET HPP SAAT STOK = 0
+                        // ==========================
+                        if ($saldoAwal <= 0) {
+                            // STOK HABIS → RESET HPP
+                            $hppNow = customRound3($hargaBatch);
+
+                            // Reset state batch
+                            $lastQtyIn = $qtyMasuk;
+                            $lastHarga = $hargaBatch;
+                            $hasLastIn = true;
+
+                        } else {
+                            // STOK MASIH ADA → MOVING AVERAGE
+                            if ($hasLastIn) {
+                                // Rumus 2-batch (sesuai desain kamu)
+                                $totalVal = ($lastQtyIn * $lastHarga) + ($qtyMasuk * $hargaBatch);
+                                $hppNow = customRound3($totalVal / $saldo);
+                            } else {
+                                // Weighted average standar
+                                $totalVal = ($saldoAwal * $hppNow) + ($qtyMasuk * $hargaBatch);
+                                $hppNow = customRound3($totalVal / $saldo);
+                            }
+
+                            // Update state batch
+                            $lastQtyIn = $qtyMasuk;
+                            $lastHarga = $hargaBatch;
+                            $hasLastIn = true;
+                        }
+                    }
+                    else {
+                        // Jika MASUK non-Batch (misal Retur)
+                        if ($saldo > 0) {
+                            $hargaNonBatch = (float) $r->harga_pokok > 0 ? (float)$r->harga_pokok : $hppNow;
+                            $totalVal = ($saldoAwal * $hppNow) + ($qtyMasuk * $hargaNonBatch);
+                            $hppNow = customRound3($totalVal / $saldo);
+                        }
+                    }
+
+                } else {
+                    // ==========================
+                    // LOGIKA KELUAR
+                    // ==========================
+                    $saldo = $saldoAwal - $qtyKeluar;
+                    if ($saldo < 0) $saldo = 0;
+                    // HPP tidak berubah
+                }
+
+                // Update Database
+                DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal" => $saldoAwal,
+                        "saldo_akhir" => $saldo,
+                        "harga_pokok" => $hppNow,
+                        "updated_at" => \Carbon\Carbon::now(),
+                    ]);
+
+                $totalUpdated++;
+            }
+
+            $affected[] = [
+                "m_item_id" => $item,
+                "m_gudang_id" => $gd,
+                "final_saldo" => $saldo,
+                "final_hpp" => $hppNow,
+            ];
+        }
+
+        DB::commit();
+
+        return response()->json([
+            "success" => true,
+            "updated" => $totalUpdated,
+            "affected" => $affected,
+        ]);
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        return response()->json([
+            "success" => false,
+            "message" => "Error: " . $e->getMessage(),
+            "line" => $e->getLine(),
+            "file" => $e->getFile()
+        ], 500);
+    }
+}
+
+public function custom_recalculateItemStokHPPBCKP2($req)
+{
+    // ==========================
+    // CUSTOM ROUND (3 decimal)
+    // ==========================
+    if (!function_exists("customRound3")) {
+        function customRound3($value)
+        {
+            $mult = 1000;
+            $scaled = $value * $mult;
+            $floor = floor($scaled);
+            $decimal = $scaled - $floor;
+
+            // 0.6 - 0.9 → ceil
+            // 0.1 - 0.5 → floor
+            return $decimal >= 0.6
+                ? ceil($scaled) / $mult
+                : floor($scaled) / $mult;
+        }
+    }
+
+    $param = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+
+    if (empty($itemIds)) {
+        return response()->json(
+            [
+                "success" => false,
+                "message" => "Parameter m_item_id wajib diisi",
+            ],
+            422
+        );
+    }
+
+    // Sanitasi
+    $itemIds = array_filter(array_map("intval", $itemIds));
+
+    DB::beginTransaction();
+    try {
+        $affected = [];
+        $totalUpdated = 0;
+
+        // Ambil kombinasi item + gudang unik
+        $targets = DB::table("kartu_stok")
+            ->select("m_item_id", "m_gudang_id")
+            ->whereIn("m_item_id", $itemIds)
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $tg) {
+            $item = (int) $tg->m_item_id;
+            $gd = (int) $tg->m_gudang_id;
+
+            // 1. Ambil urutan kronologis sebenarnya (maju ke depan)
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("created_at", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            // 2. Ambil SALDO & HPP sebelum transaksi pertama di range
+            $first = $rows->first();
+
+            $prevSaldo =
+                (float) DB::table("kartu_stok")
+                    ->where("m_item_id", $item)
+                    ->where("m_gudang_id", $gd)
+                    ->where(function ($q) use ($first) {
+                        $q->where(
+                            "date_trx",
+                            "<",
+                            $first->date_trx
+                        )->orWhere(function ($q2) use ($first) {
+                            $q2->where(
+                                "date_trx",
+                                "=",
+                                $first->date_trx
+                            )->where(function ($q3) use ($first) {
+                                $q3->where(
+                                    "created_at",
+                                    "<",
+                                    $first->created_at
+                                )->orWhere(function ($q4) use ($first) {
+                                    $q4->where(
+                                        "created_at",
+                                        "=",
+                                        $first->created_at
+                                    )->where("id", "<", $first->id);
+                                });
+                            });
+                        });
+                    })
+                    ->orderBy("date_trx", "desc")
+                    ->orderBy("created_at", "desc")
+                    ->orderBy("id", "desc")
+                    ->value("saldo_akhir") ?? 0;
+
+            $prevHpp =
+                (float) DB::table("kartu_stok")
+                    ->where("m_item_id", $item)
+                    ->where("m_gudang_id", $gd)
+                    ->where("tipe_transaksi", "MASUK")
+                    ->where(function ($q) use ($first) {
+                        $q->where(
+                            "date_trx",
+                            "<",
+                            $first->date_trx
+                        )->orWhere(function ($q2) use ($first) {
+                            $q2->where(
+                                "date_trx",
+                                "=",
+                                $first->date_trx
+                            )->where(function ($q3) use ($first) {
+                                $q3->where(
+                                    "created_at",
+                                    "<",
+                                    $first->created_at
+                                )->orWhere(function ($q4) use ($first) {
+                                    $q4->where(
+                                        "created_at",
+                                        "=",
+                                        $first->created_at
+                                    )->where("id", "<", $first->id);
+                                });
+                            });
+                        });
+                    })
+                    ->orderBy("date_trx", "desc")
+                    ->orderBy("created_at", "desc")
+                    ->orderBy("id", "desc")
+                    ->value("harga_pokok") ?? 0;
+
+            // STATE berjalan
+            $saldo = $prevSaldo; // saldo berjalan
+            $hppNow = $prevHpp; // HPP berjalan (per SAK, sama seperti kolom harga_pokok)
+            $lastQtyIn = 0.0; // qty_masuk MASUK sebelumnya (untuk rumus 2-batch)
+            $lastHarga = 0.0; // harga_sak / harga_pokok MASUK sebelumnya
+            $hasLastIn = false; // flag sudah pernah ada MASUK di range ini
+
+            foreach ($rows as $r) {
+                $qtyMasuk = (float) ($r->qty_masuk ?? 0);
+                $qtyKeluar = (float) ($r->qty_keluar ?? 0);
+
+                // 3. saldo_awal selalu saldo berjalan saat ini
+                $saldoAwal = $saldo;
+
+                // ==========================
+                // 3. DETEKSI TRANSAKSI MASUK
+                // ==========================
+                $isBatchMasuk =
+                    $r->tipe_transaksi === "MASUK" &&
+                    in_array($r->referensi_table, [
+                        "t_pres",
+                        "t_adj",
+                        "t_batch_merge",
+                        "t_penerimaan",
+                        "t_po_bahan",
+                    ]);
+
+                if ($isBatchMasuk) {
+                    // tentukan harga batch
+                    if ($r->referensi_table === "t_pres") {
+                        // PRODUKSI → harga_sak
+                        $hargaBatch = (float) $r->harga_sak;
+                        if ($hargaBatch <= 0) {
+                            $hargaBatch = (float) $r->harga_pokok;
+                        }
+                    } else {
+                        // MASUK lain → harga_pokok
+                        $hargaBatch = (float) $r->harga_pokok;
+                    }
+
+                    // saldo_akhir setelah transaksi ini (sesuai Excel)
+                    $saldoAkhir = $saldoAwal + $qtyMasuk;
+
+                    if ($saldoAkhir < 0) {
+                        $saldoAkhir = 0;
+                    }
+
+                    // rumus HPP: 2 batch terakhir (meniru Excel)
+                    if ($hasLastIn && $saldoAkhir > 0) {
+                        $totalLamaBaru =
+                            $lastQtyIn * $lastHarga +
+                            $qtyMasuk * $hargaBatch;
+                        $hppNow = customRound3(
+                            $totalLamaBaru / $saldoAkhir
+                        );
+                    } else {
+                        $denom = $saldoAwal + $qtyMasuk;
+                        if ($denom > 0) {
+                            $totalLamaBaru =
+                                $saldoAwal * $hppNow +
+                                $qtyMasuk * $hargaBatch;
+                            $hppNow = customRound3($totalLamaBaru / $denom);
+                        } else {
+                            $hppNow = customRound3($hargaBatch);
+                        }
+                    }
+
+                    // update state
+                    $saldo = $saldoAkhir;
+                    $lastQtyIn = $qtyMasuk;
+                    $lastHarga = $hargaBatch;
+                    $hasLastIn = true;
+                } else {
+                    // ==========================
+                    // KELUAR
+                    // ==========================
+                    // HPP tidak dihitung ulang → pakai hppNow terakhir
+                    $saldo = $saldoAwal - $qtyKeluar;
+                    if ($saldo < 0) {
+                        $saldo = 0; // jaga-jaga
+                    }
+                    // $hppNow tetap
+                }
+
+                // 4. Update baris di DB
+                DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal" => $saldoAwal,
+                        "saldo_akhir" => $saldo,
+                        "harga_pokok" => $hppNow, // HPP per SAK after recalc
+                        // modal_kg, harga_sak, nilai_uang sengaja TIDAK diubah
+                        "updated_at" => \Carbon\Carbon::now(),
+                    ]);
+
+                $totalUpdated++;
+            }
+
+            $affected[] = [
+                "m_item_id" => $item,
+                "m_gudang_id" => $gd,
+                "final_saldo" => $saldo,
+                "final_hpp" => $hppNow,
+            ];
+        }
+
+        DB::commit();
+
+        return response()->json([
+            "success" => true,
+            "updated" => $totalUpdated,
+            "affected" => $affected,
+        ]);
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        return response()->json(
+            [
+                "success" => false,
+                "message" => $e->getMessage(),
+            ],
+            500
+        );
+    }
+}
+
+public function custom_recalculateItemStokHPPBCKP($req)
+{
+    // ==========================
+    // CUSTOM ROUND (3 decimal)
+    // ==========================
+    if (!function_exists("customRound3")) {
+        function customRound3($value)
+        {
+            $mult = 1000;
+            $scaled = $value * $mult;
+            $floor = floor($scaled);
+            $decimal = $scaled - $floor;
+
+            // 0.6 - 0.9 → ceil
+            // 0.1 - 0.5 → floor
+            return $decimal >= 0.6
+                ? ceil($scaled) / $mult
+                : floor($scaled) / $mult;
+        }
+    }
+
+    $param = $req->input("m_item_id");
+    $itemIds = is_array($param) ? $param : [$param];
+
+    if (empty($itemIds)) {
+        return response()->json(
+            [
+                "success" => false,
+                "message" => "Parameter m_item_id wajib diisi",
+            ],
+            422
+        );
+    }
+
+    // Sanitasi
+    $itemIds = array_filter(array_map("intval", $itemIds));
+
+    DB::beginTransaction();
+    try {
+        $affected = [];
+        $totalUpdated = 0;
+
+        // Ambil kombinasi item + gudang unik
+        $targets = DB::table("kartu_stok")
+            ->select("m_item_id", "m_gudang_id")
+            ->whereIn("m_item_id", $itemIds)
+            ->distinct()
+            ->get();
+
+        foreach ($targets as $tg) {
+            $item = (int) $tg->m_item_id;
+            $gd = (int) $tg->m_gudang_id;
+
+            // 1. Ambil urutan kronologis sebenarnya (maju ke depan)
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gd)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("created_at", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->get();
+
+            if ($rows->isEmpty()) {
+                continue;
+            }
+
+            // 2. Ambil SALDO & HPP sebelum transaksi pertama di range
+            $first = $rows->first();
+
+            $prevSaldo =
+                (float) DB::table("kartu_stok")
+                    ->where("m_item_id", $item)
+                    ->where("m_gudang_id", $gd)
+                    ->where(function ($q) use ($first) {
+                        $q->where(
+                            "date_trx",
+                            "<",
+                            $first->date_trx
+                        )->orWhere(function ($q2) use ($first) {
+                            $q2->where(
+                                "date_trx",
+                                "=",
+                                $first->date_trx
+                            )->where(function ($q3) use ($first) {
+                                $q3->where(
+                                    "created_at",
+                                    "<",
+                                    $first->created_at
+                                )->orWhere(function ($q4) use ($first) {
+                                    $q4->where(
+                                        "created_at",
+                                        "=",
+                                        $first->created_at
+                                    )->where("id", "<", $first->id);
+                                });
+                            });
+                        });
+                    })
+                    ->orderBy("date_trx", "desc")
+                    ->orderBy("created_at", "desc")
+                    ->orderBy("id", "desc")
+                    ->value("saldo_akhir") ?? 0;
+
+            $prevHpp =
+                (float) DB::table("kartu_stok")
+                    ->where("m_item_id", $item)
+                    ->where("m_gudang_id", $gd)
+                    ->where("tipe_transaksi", "MASUK")
+                    ->where(function ($q) use ($first) {
+                        $q->where(
+                            "date_trx",
+                            "<",
+                            $first->date_trx
+                        )->orWhere(function ($q2) use ($first) {
+                            $q2->where(
+                                "date_trx",
+                                "=",
+                                $first->date_trx
+                            )->where(function ($q3) use ($first) {
+                                $q3->where(
+                                    "created_at",
+                                    "<",
+                                    $first->created_at
+                                )->orWhere(function ($q4) use ($first) {
+                                    $q4->where(
+                                        "created_at",
+                                        "=",
+                                        $first->created_at
+                                    )->where("id", "<", $first->id);
+                                });
+                            });
+                        });
+                    })
+                    ->orderBy("date_trx", "desc")
+                    ->orderBy("created_at", "desc")
+                    ->orderBy("id", "desc")
+                    ->value("harga_pokok") ?? 0;
+
+            // STATE berjalan
+            $saldo = $prevSaldo; // saldo berjalan
+            $hppNow = $prevHpp; // HPP berjalan (per SAK, sama seperti kolom harga_pokok)
+            $lastQtyIn = 0.0; // qty_masuk MASUK sebelumnya (untuk rumus 2-batch)
+            $lastHarga = 0.0; // harga_sak / harga_pokok MASUK sebelumnya
+            $hasLastIn = false; // flag sudah pernah ada MASUK di range ini
+
+            foreach ($rows as $r) {
+                $qtyMasuk = (float) ($r->qty_masuk ?? 0);
+                $qtyKeluar = (float) ($r->qty_keluar ?? 0);
+
+                // 3. saldo_awal selalu saldo berjalan saat ini
+                $saldoAwal = $saldo;
+
+                if ($r->tipe_transaksi === "MASUK") {
+                    // 3a. Penentuan harga batch dasar (untuk jadi "harga_sak" di rumus Excel)
+                    if (
+                        $r->referensi_table === "t_pres" ||
+                        $r->referensi_table === "t_matrelease"
+                    ) {
+                        // PRODUKSI → harga_sak dipakai sebagai harga batch per SAK
+                        $hargaBatch = (float) $r->harga_sak;
+                        if ($hargaBatch <= 0) {
+                            $hargaBatch = (float) $r->harga_pokok;
+                        }
+                    } else {
+                        // Non produksi → pakai harga_pokok
+                        $hargaBatch = (float) $r->harga_pokok;
+                    }
+
+                    // saldo_akhir setelah transaksi ini (dipakai sebagai DENOM di Excel: kolom R)
+                    $saldoAkhir = $saldoAwal + $qtyMasuk - $qtyKeluar;
+
+                    if ($saldoAkhir < 0) {
+                        $saldoAkhir = 0; // jaga-jaga
+                    }
+
+                    // 3b. Rumus HPP, meniru formula Excel:
+                    // - Kalau SUDAH ada MASUK sebelumnya di range:
+                    //     HPP = (qty_last * harga_last + qty_now * hargaBatch) / saldoAkhir
+                    // - Kalau BELUM ada MASUK di range:
+                    //     HPP = (prevSaldo * prevHpp + qty_now * hargaBatch) / (prevSaldo + qty_now)
+                    if ($hasLastIn && $saldoAkhir > 0) {
+                        $totalLamaBaru =
+                            $lastQtyIn * $lastHarga +
+                            $qtyMasuk * $hargaBatch;
+                        $hppNow = customRound3(
+                            $totalLamaBaru / $saldoAkhir
+                        );
+                    } else {
+                        $denom = $saldoAwal + $qtyMasuk;
+                        if ($denom > 0) {
+                            $totalLamaBaru =
+                                $saldoAwal * $hppNow +
+                                $qtyMasuk * $hargaBatch;
+                            $hppNow = customRound3($totalLamaBaru / $denom);
+                        } else {
+                            // stok awal 0 & belum ada HPP → langsung ambil harga batch
+                            $hppNow = customRound3($hargaBatch);
+                        }
+                    }
+
+                    // Update saldo & state MASUK terakhir
+                    $saldo = $saldoAkhir;
+                    $lastQtyIn = $qtyMasuk;
+                    $lastHarga = $hargaBatch;
+                    $hasLastIn = true;
+                } else {
+                    // ==========================
+                    // KELUAR
+                    // ==========================
+                    // HPP tidak dihitung ulang → pakai hppNow terakhir
+                    $saldo = $saldoAwal - $qtyKeluar;
+                    if ($saldo < 0) {
+                        $saldo = 0; // jaga-jaga
+                    }
+                    // $hppNow tetap
+                }
+
+                // 4. Update baris di DB
+                DB::table("kartu_stok")
+                    ->where("id", $r->id)
+                    ->update([
+                        "saldo_awal" => $saldoAwal,
+                        "saldo_akhir" => $saldo,
+                        "harga_pokok" => $hppNow, // HPP per SAK after recalc
+                        // modal_kg, harga_sak, nilai_uang sengaja TIDAK diubah
+                        "updated_at" => \Carbon\Carbon::now(),
+                    ]);
+
+                $totalUpdated++;
+            }
+
+            $affected[] = [
+                "m_item_id" => $item,
+                "m_gudang_id" => $gd,
+                "final_saldo" => $saldo,
+                "final_hpp" => $hppNow,
+            ];
+        }
+
+        DB::commit();
+
+        return response()->json([
+            "success" => true,
+            "updated" => $totalUpdated,
+            "affected" => $affected,
+        ]);
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        return response()->json(
+            [
+                "success" => false,
+                "message" => $e->getMessage(),
+            ],
+            500
+        );
+    }
+}
