@@ -42,7 +42,7 @@ $po = DB::table('t_penerimaan as tp')
         tp.created_at
     ");
 
-// --- 2) SJ KELUAR ---
+// --- 2) SJ KELUAR (samakan dengan stock overview - pakai berat_kirim dari header) ---
 $so = DB::table('t_surat_jalan as tsj')
     ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
     ->leftJoin('m_customer as mc','mc.id','=','tso.m_customer_id')
@@ -60,6 +60,24 @@ $so = DB::table('t_surat_jalan as tsj')
         tsjd.m_gudang_d_id as kavling_id,
         NULL::numeric as berat_masuk,
         COALESCE(tsjd.berat_sj,0)::numeric as berat_keluar,
+        tsj.created_at
+    ");
+
+// --- 2B) SJ KELUAR GLOBAL (untuk balance global - samakan dengan stock overview) ---
+$soGlobal = DB::table('t_surat_jalan as tsj')
+    ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
+    ->leftJoin('m_customer as mc','mc.id','=','tso.m_customer_id')
+    ->selectRaw("
+        tsj.tgl as tanggal,
+        tso.no_so::text as no_referensi,
+        mc.nama::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        NULL::text as nama_gudang,
+        NULL::text as nama_kavling,
+        NULL::integer as gudang_id,
+        NULL::integer as kavling_id,
+        NULL::numeric as berat_masuk,
+        COALESCE(tsj.berat_kirim,0)::numeric as berat_keluar,
         tsj.created_at
     ");
 
@@ -161,7 +179,7 @@ $transformTujuan = DB::table('t_transform_item as tti')
 
 $transform = $transformAsal->unionAll($transformTujuan);
 
-// --- GABUNG SEMUA DATA (TANPA FILTER) ---
+// --- GABUNG SEMUA DATA UNTUK TAMPILAN (dengan detail gudang/kavling) ---
 $allData = DB::query()
     ->fromSub($po
         ->unionAll($so)
@@ -172,37 +190,122 @@ $allData = DB::query()
     ->orderBy('created_at','asc')
     ->get();
 
-// =================== HITUNG BALANCE GLOBAL & FILTER TAMPILAN ===================
-$balance = 0;
+// =================== HITUNG BALANCE GLOBAL (SAMAKAN DENGAN STOCK OVERVIEW) ===================
+// Menggunakan metode yang sama persis dengan web_report_laporan_stock.blade.php
+
+// --- DATA GLOBAL MASUK (PO/PENERIMAAN) ---
+$dataPoGlobal = DB::table('t_penerimaan as tp')
+    ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+    ->where('tp.status','POST')
+    ->when($periodeTo, fn($q)=>$q->whereDate('tp.tgl_penerimaan','<=',$periodeTo))
+    ->selectRaw("
+        tp.tgl_penerimaan as tanggal,
+        SUM(tp.total_netto)::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        NULL::numeric as total_adj,
+        'PO'::text as tipe,
+        MIN(tp.created_at) as created_src
+    ")
+    ->groupBy('tp.tgl_penerimaan');
+
+// --- DATA GLOBAL KELUAR (SO/SJ) - pakai berat_kirim dari header ---
+$dataSoGlobal = DB::table('t_surat_jalan as tsj')
+    ->when($periodeTo, fn($q)=>$q->whereDate('tsj.tgl','<=',$periodeTo))
+    ->selectRaw("
+        tsj.tgl as tanggal,
+        NULL::numeric as berat_masuk,
+        COALESCE(tsj.berat_kirim,0)::numeric as berat_keluar,
+        NULL::numeric as total_adj,
+        'SJ'::text as tipe,
+        tsj.created_at as created_src
+    ");
+
+// --- DATA GLOBAL ADJUSTMENT ---
+$dataAdjGlobal = DB::table('t_adjustment_stock as tas')
+    ->join('t_adjustment_stock_d as tasd','tasd.t_adjustment_stock_id','=','tas.id')
+    ->where('tas.status','POST')
+    ->when($periodeTo, fn($q)=>$q->whereDate('tas.tgl','<=',$periodeTo))
+    ->selectRaw("
+        tas.tgl as tanggal,
+        CASE WHEN tasd.berat_adjustment > 0 THEN tasd.berat_adjustment ELSE NULL END::numeric as berat_masuk,
+        CASE WHEN tasd.berat_adjustment < 0 THEN ABS(tasd.berat_adjustment) ELSE NULL END::numeric as berat_keluar,
+        COALESCE(tasd.total,0)::numeric as total_adj,
+        'ADJ'::text as tipe,
+        tas.created_at as created_src
+    ");
+
+// --- UNION DATA GLOBAL (TANPA Transfer & Transform karena net = 0) ---
+$allGlobalData = DB::query()
+    ->fromSub($dataPoGlobal->unionAll($dataSoGlobal)->unionAll($dataAdjGlobal), 'global_history')
+    ->orderBy('tanggal','asc')
+    ->orderBy('created_src','asc')
+    ->get();
+
+// --- HITUNG BALANCE GLOBAL ---
+$globalBalance = 0;
+foreach ($allGlobalData as $row) {
+    $beratMasuk  = (float)($row->berat_masuk ?? 0);
+    $beratKeluar = (float)($row->berat_keluar ?? 0);
+    $globalBalance += $beratMasuk - $beratKeluar;
+}
+
+// =================== FILTER TAMPILAN & HITUNG RUNNING BALANCE ===================
+// Jika ada filter gudang/kavling, hitung balance khusus untuk filter tersebut
+// Jika tidak ada filter, gunakan balance global
+
+$filteredBalance = 0;  // Balance untuk data yang difilter (gudang/kavling tertentu)
 $displayData = [];
 $rowNumber = 0;
 
 foreach ($allData as $row) {
     $beratMasuk  = (float)($row->berat_masuk ?? 0);
     $beratKeluar = (float)($row->berat_keluar ?? 0);
-    $balance += $beratMasuk - $beratKeluar;
     
-    // Simpan balance ke row
-    $row->calculated_balance = $balance;
+    // Cek apakah row ini masuk filter gudang/kavling
+    $matchGudang = true;
+    $matchKavling = true;
+    $matchPeriode = true;
     
-    // Cek apakah row ini masuk filter tampilan
+    if ($gudangId && $row->gudang_id != $gudangId) {
+        $matchGudang = false;
+    }
+    if ($kavlingId && $row->kavling_id != $kavlingId) {
+        $matchKavling = false;
+    }
+    // Filter periode untuk balance (hanya sampai periodeTo)
+    if ($periodeTo && $row->tanggal > $periodeTo) {
+        $matchPeriode = false;
+    }
+    
+    // Jika ada filter gudang/kavling, hanya hitung balance untuk transaksi yang match
+    // Dan pastikan dalam periode yang dipilih
+    if ($matchGudang && $matchKavling && $matchPeriode) {
+        $filteredBalance += $beratMasuk - $beratKeluar;
+    }
+    
+    // Simpan running balance ke row (hanya jika dalam filter)
+    if ($matchGudang && $matchKavling && $matchPeriode) {
+        $row->calculated_balance = $filteredBalance;
+    }
+    
+    // Cek apakah row ini masuk filter tampilan (termasuk periode)
     $showRow = true;
     
-    // Filter periode
+    // Filter periode (untuk tampilan, termasuk periodeFrom)
     if ($periodeFrom && $row->tanggal < $periodeFrom) {
         $showRow = false;
     }
-    if ($periodeTo && $row->tanggal > $periodeTo) {
+    if (!$matchPeriode) {
         $showRow = false;
     }
     
     // Filter gudang
-    if ($gudangId && $row->gudang_id != $gudangId) {
+    if (!$matchGudang) {
         $showRow = false;
     }
     
     // Filter kavling
-    if ($kavlingId && $row->kavling_id != $kavlingId) {
+    if (!$matchKavling) {
         $showRow = false;
     }
     
@@ -214,6 +317,11 @@ foreach ($allData as $row) {
 }
 
 $data = collect($displayData);
+
+// =================== BALANCE AKHIR ===================
+// Jika ada filter gudang/kavling → gunakan balance yang sudah difilter
+// Jika tidak ada filter → gunakan balance global (sama dengan stock overview)
+$balanceGlobal = ($gudangId || $kavlingId) ? $filteredBalance : $globalBalance;
 @endphp
 
 {{-- =================== VIEW =================== --}}
@@ -269,6 +377,24 @@ $data = collect($displayData);
           </td>
         </tr>
       @endforeach
+      
+      {{-- TOTAL ROW - Balance Global (samakan dengan Stock Overview) --}}
+      @php
+        $totalMasuk = $data->sum(fn($r) => (float)($r->berat_masuk ?? 0));
+        $totalKeluar = $data->sum(fn($r) => (float)($r->berat_keluar ?? 0));
+      @endphp
+      <tr style="font-weight:bold;background:#f2f2f2;">
+        <td colspan="7" style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">TOTAL</td>
+        <td style="border:1px solid #000;text-align:right;padding:6px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($totalMasuk) : number_format($totalMasuk, 0, ',', '.') }}
+        </td>
+        <td style="border:1px solid #000;text-align:right;padding:6px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($totalKeluar) : number_format($totalKeluar, 0, ',', '.') }}
+        </td>
+        <td style="border:1px solid #000;text-align:right;padding:6px;font-size:10px;font-weight:bold;background:#e6ffe6;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($balanceGlobal) : number_format($balanceGlobal, 0, ',', '.') }}
+        </td>
+      </tr>
     </tbody>
   </table>
 </div>
