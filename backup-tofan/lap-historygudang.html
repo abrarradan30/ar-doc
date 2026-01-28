@@ -1,281 +1,274 @@
 @php
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
-$req    = app()->request;
-$helper = getCore('Helper');
+$req     = app()->request;
+$helper  = getCore('Helper');
 
-/* ================= EXPORT ================= */
+// =================== EXPORT HANDLING ===================
 $exportParam   = strtolower((string)($req->get('export') ?? ''));
 $isExcelExport = in_array($exportParam, ['xls','xlsx','excel','csv'], true);
 
-$fmtBrowser     = fn($v) => number_format((float)($v ?? 0), 0, ',', '.');
 $fmtExportPlain = fn($v) => (int)round((float)($v ?? 0));
 $cellNumberStyle = "mso-number-format:'\\0022Rp\\0022 #,##0';";
 
-/* ================= PERIODE ================= */
+// =================== PARAMETER ===================
+$gudangId   = $req->get('gudang_id');
+$kavlingId  = $req->get('kavling_id');
 $periodeFrom = $req->get('periode_from') ? date('Y-m-d', strtotime($req->get('periode_from'))) : null;
-$periodeTo   = $req->get('periode_to')   ? date('Y-m-d', strtotime($req->get('periode_to')))   : null;
+$periodeTo   = $req->get('periode_to') ? date('Y-m-d', strtotime($req->get('periode_to'))) : null;
 
-/* =========================================================
-   STEP 1️⃣ : HITUNG HPP (SAMA PERSIS DENGAN LAPORAN HPP)
-   ========================================================= */
+// =================== QUERY SEMUA DATA (TANPA FILTER GUDANG/KAVLING) ===================
+// Balance dihitung secara GLOBAL, filter hanya untuk tampilan
 
-// ======================= DATA PO (MASUK) =======================
-$aggPiDetail = DB::table('t_pi_bahan_d as tpid')
-    ->select(
-        'tpid.t_penerimaan_id',
-        DB::raw('AVG(tpid.harga_nett) AS avg_harga_nett'),
-        DB::raw('MAX(tpid.kadar_air)  AS max_kadar_air')
-    )
-    ->groupBy('tpid.t_penerimaan_id');
+// --- 1) PO MASUK ---
+$po = DB::table('t_penerimaan as tp')
+    ->join('t_po_bahan as tpo','tpo.id','=','tp.t_po_bahan_id')
+    ->leftJoin('m_supplier as ms','ms.id','=','tpo.m_supplier_id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tp.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tp.kavling_id')
+    ->where('tp.status','POST')
+    ->selectRaw("
+        tp.tgl_penerimaan as tanggal,
+        tpo.no_po::text as no_referensi,
+        ms.nama_supplier::text as nama_supplier_customer,
+        tp.kadar_air::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tp.m_gudang_id as gudang_id,
+        tp.kavling_id as kavling_id,
+        tp.total_netto::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        tp.created_at
+    ");
 
-$dataPo = DB::table('t_penerimaan as tp')
-    ->join('t_po_bahan as tpo', 'tpo.id', '=', 'tp.t_po_bahan_id')
-    ->join('m_supplier as ms', 'ms.id', '=', 'tpo.m_supplier_id')
-    ->leftJoinSub($aggPiDetail, 'pid', fn($j) => $j->on('pid.t_penerimaan_id', '=', 'tp.id'))
-    ->select(
-        'tpo.no_po as no_referensi',
-        'tp.no_penerimaan',
-        'tp.tgl_penerimaan as tanggal',
-        'ms.nama_supplier as supplier_customer',
-        DB::raw('COALESCE(MAX(pid.max_kadar_air), tp.kadar_air, 0)::numeric AS kadar_air'),
-        DB::raw('COALESCE(MAX(pid.avg_harga_nett), tpo.harga_sepakat, 0)::numeric AS harga_nett'),
-        DB::raw('SUM(tp.total_netto)::numeric AS berat_masuk'),
-        DB::raw('NULL::numeric AS berat_keluar'),
-        DB::raw('NULL::numeric AS hpp_adj'),
-        DB::raw('NULL::numeric AS total_adj'),
-        DB::raw('MIN(tp.created_at) AS created_src'),
-        DB::raw('NULL::bigint AS sj_id')
-    )
-    ->where('tp.status', 'POST')
-    ->when($periodeTo,   fn($q) => $q->whereDate('tp.tgl_penerimaan', '<=', $periodeTo))
-    ->groupBy('tpo.no_po', 'tp.no_penerimaan', 'tp.tgl_penerimaan', 'ms.nama_supplier', 'tpo.harga_sepakat', 'tp.kadar_air');
-
-// ======================= DATA SO / SJ (KELUAR) =======================
-$dataSo = DB::table('t_surat_jalan as tsj')
+// --- 2) SJ KELUAR ---
+$so = DB::table('t_surat_jalan as tsj')
     ->join('t_sales_order as tso','tso.id','=','tsj.t_sales_order_id')
-    ->join('m_customer as mc','mc.id','=','tso.m_customer_id')
-    ->select(
-        'tso.no_so as no_referensi',
-        DB::raw('NULL::text as no_penerimaan'),
-        'tsj.tgl as tanggal',
-        'mc.nama as supplier_customer',
-        DB::raw('NULL::numeric as kadar_air'),
-        DB::raw('NULL::numeric as harga_nett'),
-        DB::raw('NULL::numeric as berat_masuk'),
-        'tsj.berat_kirim as berat_keluar',
-        DB::raw('NULL::numeric as hpp_adj'),
-        DB::raw('NULL::numeric as total_adj'),
-        DB::raw('tsj.created_at as created_src'),
-        'tsj.id as sj_id'
-    )
-    // NOTE: TIDAK ADA where status POST - SAMA DENGAN LAPORAN HPP
-    ->when($periodeTo,   fn($q) => $q->whereDate('tsj.tgl', '<=', $periodeTo));
+    ->leftJoin('m_customer as mc','mc.id','=','tso.m_customer_id')
+    ->leftJoin('t_surat_jalan_d as tsjd','tsjd.t_surat_jalan_id','=','tsj.id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tsjd.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tsjd.m_gudang_d_id')
+    ->selectRaw("
+        tsj.tgl as tanggal,
+        tso.no_so::text as no_referensi,
+        mc.nama::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tsjd.m_gudang_id as gudang_id,
+        tsjd.m_gudang_d_id as kavling_id,
+        NULL::numeric as berat_masuk,
+        COALESCE(tsjd.berat_sj,0)::numeric as berat_keluar,
+        tsj.created_at
+    ");
 
-// ======================= DATA ADJUSTMENT =======================
-$dataAdj = DB::table('t_adjustment_stock as tas')
-    ->join('t_adjustment_stock_d as tasd','tasd.t_adjustment_stock_id','=','tas.id')
-    ->select(
-        'tas.no_adj as no_referensi',
-        DB::raw('NULL::text as no_penerimaan'),
-        'tas.tgl as tanggal',
-        DB::raw("'Adjustment Stock' as supplier_customer"),
-        DB::raw('NULL::numeric as kadar_air'),
-        DB::raw('COALESCE(tasd.harga_nett,0)::numeric as harga_nett'),
-        DB::raw("CASE WHEN tasd.berat_adjustment > 0 THEN tasd.berat_adjustment ELSE NULL END::numeric as berat_masuk"),
-        DB::raw("CASE WHEN tasd.berat_adjustment < 0 THEN ABS(tasd.berat_adjustment) ELSE NULL END::numeric as berat_keluar"),
-        DB::raw('COALESCE(tasd.hpp,0)::numeric as hpp_adj'),
-        DB::raw('COALESCE(tasd.total,0)::numeric as total_adj'),
-        DB::raw('tas.created_at as created_src'),
-        DB::raw('NULL::bigint AS sj_id')
-    )
+// --- 3) ADJUSTMENT ---
+$adjustment = DB::table('t_adjustment_stock_d as tasd')
+    ->join('t_adjustment_stock as tas','tas.id','=','tasd.t_adjustment_stock_id')
+    ->leftJoin('m_gudang as mg','mg.id','=','tas.m_gudang_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tas.m_gudang_d_id')
     ->where('tas.status','POST')
-    ->when($periodeTo,   fn($q) => $q->whereDate('tas.tgl', '<=', $periodeTo));
+    ->selectRaw("
+        tas.tgl as tanggal,
+        tas.no_adj::text as no_referensi,
+        'Adjustment Stock'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tas.m_gudang_id as gudang_id,
+        tas.m_gudang_d_id as kavling_id,
+        CASE WHEN tasd.berat_adjustment > 0 THEN tasd.berat_adjustment ELSE NULL END::numeric as berat_masuk,
+        CASE WHEN tasd.berat_adjustment < 0 THEN ABS(tasd.berat_adjustment) ELSE NULL END::numeric as berat_keluar,
+        tas.created_at
+    ");
 
-// ======================= UNION ALL & SORT =======================
-$allTransaksi = DB::query()
-    ->fromSub(
-        $dataPo->unionAll($dataSo)->unionAll($dataAdj),
-        'history'
-    )
-    ->orderBy('tanggal', 'asc')
-    ->orderBy('created_src', 'asc')
+// --- 4) TRANSFER GUDANG ---
+$transferAsal = DB::table('t_transfer_gudang as ttg')
+    ->leftJoin('m_gudang as mg','mg.id','=','ttg.m_gudang_a_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','ttg.m_gudang_d_a_id')
+    ->where('ttg.status','POST')
+    ->selectRaw("
+        ttg.tgl as tanggal,
+        ttg.no_tg::text as no_referensi,
+        'Transfer Gudang'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        ttg.m_gudang_a_id as gudang_id,
+        ttg.m_gudang_d_a_id as kavling_id,
+        NULL::numeric as berat_masuk,
+        COALESCE(ttg.berat,0)::numeric as berat_keluar,
+        ttg.created_at
+    ");
+
+$transferTujuan = DB::table('t_transfer_gudang as ttg')
+    ->leftJoin('m_gudang as mg','mg.id','=','ttg.m_gudang_t_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','ttg.m_gudang_d_t_id')
+    ->where('ttg.status','POST')
+    ->selectRaw("
+        ttg.tgl as tanggal,
+        ttg.no_tg::text as no_referensi,
+        'Transfer Gudang'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        ttg.m_gudang_t_id as gudang_id,
+        ttg.m_gudang_d_t_id as kavling_id,
+        COALESCE(ttg.berat,0)::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        ttg.created_at
+    ");
+
+$transfer = $transferAsal->unionAll($transferTujuan);
+
+// --- 5) TRANSFORM ITEM ---
+$transformAsal = DB::table('t_transform_item as tti')
+    ->leftJoin('m_gudang as mg','mg.id','=','tti.m_gudang_a_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tti.m_gudang_d_a_id')
+    ->where('tti.status','POST')
+    ->selectRaw("
+        tti.tgl as tanggal,
+        tti.no_ti::text as no_referensi,
+        'Transform Item'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tti.m_gudang_a_id as gudang_id,
+        tti.m_gudang_d_a_id as kavling_id,
+        NULL::numeric as berat_masuk,
+        COALESCE(tti.berat,0)::numeric as berat_keluar,
+        tti.created_at
+    ");
+
+$transformTujuan = DB::table('t_transform_item as tti')
+    ->leftJoin('m_gudang as mg','mg.id','=','tti.m_gudang_t_id')
+    ->leftJoin('m_gudang_d as mgd','mgd.id','=','tti.m_gudang_d_t_id')
+    ->where('tti.status','POST')
+    ->selectRaw("
+        tti.tgl as tanggal,
+        tti.no_ti::text as no_referensi,
+        'Transform Item'::text as nama_supplier_customer,
+        NULL::numeric as kadar_air,
+        mg.nama::text as nama_gudang,
+        mgd.nama::text as nama_kavling,
+        tti.m_gudang_t_id as gudang_id,
+        tti.m_gudang_d_t_id as kavling_id,
+        COALESCE(tti.berat,0)::numeric as berat_masuk,
+        NULL::numeric as berat_keluar,
+        tti.created_at
+    ");
+
+$transform = $transformAsal->unionAll($transformTujuan);
+
+// --- GABUNG SEMUA DATA (TANPA FILTER) ---
+$allData = DB::query()
+    ->fromSub($po
+        ->unionAll($so)
+        ->unionAll($adjustment)
+        ->unionAll($transfer)
+        ->unionAll($transform), 'history')
+    ->orderBy('tanggal','asc')
+    ->orderBy('created_at','asc')
     ->get();
 
-// ======================= VARIABEL AGREGAT =======================
-$stok  = 0;
-$nilai = 0.0;
-$hpp   = 0.0;
+// =================== HITUNG BALANCE GLOBAL & FILTER TAMPILAN ===================
+$balance = 0;
+$displayData = [];
+$rowNumber = 0;
 
-/**
- * MAP: sj_id => hpp_keluar
- * HARUS SAMA PERSIS dengan $rowHargaHppKeluar di laporan HPP
- */
-$sjHppMap = [];
-
-foreach ($allTransaksi as $row) {
-    $beratMasuk   = (float)($row->berat_masuk ?? 0);
-    $beratKeluar  = (float)($row->berat_keluar ?? 0);
-    $hargaNetInit = (float)($row->harga_nett ?? 0);
-    $hppAdj        = (float)($row->hpp_adj ?? 0);
-    $totalAdj      = (float)($row->total_adj ?? 0);
-
-    $isAdjustment = (stripos((string)$row->supplier_customer, 'Adjustment') !== false);
-    $hppBefore = $hpp;
-
-    $rowHargaNett       = $hargaNetInit;
-    $rowTotalMasuk      = 0.0;
-    $rowHargaHppKeluar  = 0.0;
-    $rowTotalKeluar     = 0.0;
-
-    // =================== CALCULATE MOVING AVERAGE (SAMA PERSIS DENGAN LAPORAN HPP) ===================
-    if (!$isAdjustment && $beratMasuk > 0) {
-        $rowTotalMasuk = $beratMasuk * $rowHargaNett;
-        $nilai += $rowTotalMasuk;
-        $stok  += $beratMasuk;
-        $hpp   = $stok > 0 ? ($nilai / $stok) : 0;
+foreach ($allData as $row) {
+    $beratMasuk  = (float)($row->berat_masuk ?? 0);
+    $beratKeluar = (float)($row->berat_keluar ?? 0);
+    $balance += $beratMasuk - $beratKeluar;
+    
+    // Simpan balance ke row
+    $row->calculated_balance = $balance;
+    
+    // Cek apakah row ini masuk filter tampilan
+    $showRow = true;
+    
+    // Filter periode
+    if ($periodeFrom && $row->tanggal < $periodeFrom) {
+        $showRow = false;
     }
-    elseif (!$isAdjustment && $beratKeluar > 0) {
-        // 🔴 INI PERSIS SAMA DENGAN LAPORAN HPP (line 207 web_report_hpp.blade.php)
-        $rowHargaHppKeluar = $hppBefore;
-        $rowTotalKeluar    = $beratKeluar * $rowHargaHppKeluar;
-        
-        // Simpan ke map berdasarkan sj_id
-        if ($row->sj_id) {
-            $sjHppMap[$row->sj_id] = $rowHargaHppKeluar;
-        }
-        
-        $nilai -= $rowTotalKeluar;
-        $stok  -= $beratKeluar;
-        $hpp   = $stok > 0 ? ($nilai / $stok) : 0;
+    if ($periodeTo && $row->tanggal > $periodeTo) {
+        $showRow = false;
     }
-    elseif ($isAdjustment) {
-        if ($beratMasuk > 0) {
-            // Koreksi Nilai Adjustment Plus (SAMA PERSIS DENGAN LAPORAN HPP)
-            if ($totalAdj > 0) $rowTotalMasuk = $totalAdj;
-            elseif ($rowHargaNett > 0) $rowTotalMasuk = $beratMasuk * $rowHargaNett;
-            else $rowTotalMasuk = 0; // Stok only adjustment
-
-            $nilai += $rowTotalMasuk;
-            $stok  += $beratMasuk;
-            $hpp   = $stok > 0 ? ($nilai / $stok) : 0;
-        } elseif ($beratKeluar > 0) {
-            // Koreksi Nilai Adjustment Minus (SAMA PERSIS DENGAN LAPORAN HPP)
-            if ($totalAdj > 0) $rowTotalKeluar = $totalAdj;
-            elseif ($hppAdj > 0) $rowTotalKeluar = $beratKeluar * $hppAdj;
-            else $rowTotalKeluar = 0; // Stok only adjustment
-
-            $nilai -= $rowTotalKeluar;
-            $stok  -= $beratKeluar;
-            $hpp   = $stok > 0 ? ($nilai / $stok) : 0;
-            $rowHargaHppKeluar = $beratKeluar > 0 ? ($rowTotalKeluar / $beratKeluar) : 0;
-        }
+    
+    // Filter gudang
+    if ($gudangId && $row->gudang_id != $gudangId) {
+        $showRow = false;
+    }
+    
+    // Filter kavling
+    if ($kavlingId && $row->kavling_id != $kavlingId) {
+        $showRow = false;
+    }
+    
+    if ($showRow) {
+        $rowNumber++;
+        $row->row_number = $rowNumber;
+        $displayData[] = $row;
     }
 }
 
-/* =========================================================
-   STEP 2️⃣ : DATA PENJUALAN
-   ========================================================= */
-
-$rows = DB::table('t_sales_invoice as si')
-    ->join('t_sales_invoice_d as sid','sid.t_sales_invoice_id','=','si.id')
-    ->leftJoin('t_surat_jalan as sj','sj.id','=','sid.t_surat_jalan_id')
-    ->leftJoin('t_sales_order as so','so.id','=','si.t_sales_order_id')
-    ->leftJoin('m_customer as mc','mc.id','=','so.m_customer_id')
-    ->leftJoin('t_po_bahan as po','po.id','=','si.t_po_bahan_id')
-    ->leftJoin('m_supplier as ms','ms.id','=','po.m_supplier_id')
-    ->select(
-        'si.id',
-        'si.is_trading',
-        'so.no_po_customer',
-        'so.no_so',
-        'mc.nama as nama_customer',
-        'so.penerima',
-        'so.harga as harga_so',
-        'sid.tgl_sj',
-        'sid.no_polisi',
-        'sid.berat_sj',
-        'sid.berat_si',
-        'sid.berat_net',
-        'sid.harga_net',
-        'sid.total as total_si',
-        'sid.t_surat_jalan_id as sj_id',
-        'po.harga_sepakat',
-        'ms.nama_supplier'
-    )
-    ->where('si.status','POST')
-    ->when($periodeFrom, fn($q)=>$q->whereDate('sid.tgl_sj','>=',$periodeFrom))
-    ->when($periodeTo,   fn($q)=>$q->whereDate('sid.tgl_sj','<=',$periodeTo))
-    ->orderBy('sid.tgl_sj')
-    ->orderBy('si.id')
-    ->get();
+$data = collect($displayData);
 @endphp
 
+{{-- =================== VIEW =================== --}}
 <div>
-  <h1 style="font-weight:bold;text-align:center;">Laporan Penjualan Gudang</h1>
-  <p style="text-align:center;">
-    Periode :
-    {{ $periodeFrom ? $helper->formatDateId($periodeFrom) : 'Awal' }}
-    {{ $periodeTo ? '- '.$helper->formatDateId($periodeTo) : '' }}
-  </p><br>
+  <div style="text-align:center; margin-bottom:10px;">
+    <h1 style="font-weight:bold; margin:0;">LAPORAN HISTORY GUDANG</h1>
+    <p style="margin:4px 0 0 0;">
+      PERIODE 
+      {{ $req->periode_from ? $helper->formatDateId($req->periode_from) : '-' }}
+      {{ $req->periode_to ? '- '.$helper->formatDateId($req->periode_to) : '' }}
+    </p>
+  </div>
 
-  <table style="border:1px solid black;border-collapse:collapse;width:100%;font-size:8px;">
+  <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
     <thead>
-      <tr style="background:#f2f2f2;">
-        @foreach(['No','No PO','Supplier','Harga PO / HPP','No SO','Customer','Penerima','Harga SO','Tanggal','No Pol','Berat SJ','Berat SI','Berat Net','Harga Net','Total SI','Total HPP'] as $h)
-          <th style="border:1px solid #000;padding:4px;text-align:center;">{{ $h }}</th>
-        @endforeach
+      <tr>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">No.</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Tanggal</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">No Referensi</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Gudang</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Kavling</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Supplier / Customer</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">KA (%)</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Berat Masuk</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Berat Keluar</th>
+        <th style="border:1px solid #000;padding:6px;text-align:center;font-size:10px;">Balance</th>
       </tr>
     </thead>
     <tbody>
-    @foreach($rows as $i=>$r)
-      @php
-        if ($r->is_trading) {
-            $hppSatuan = (float)$r->harga_sepakat;
-            $totalHpp  = $hppSatuan * (float)$r->berat_sj;
-            $supplier  = $r->nama_supplier;
-        } else {
-            // 🔴 PASTI SAMA DENGAN LAPORAN HPP
-            $hppSatuan = $sjHppMap[$r->sj_id] ?? 0;
-            $totalHpp  = $hppSatuan * (float)$r->berat_sj;
-            $supplier  = 'CV TOFAN';
-        }
-      @endphp
-      <tr>
-        <td style="border:1px solid #000;text-align:center;">{{ $i+1 }}</td>
-        <td style="border:1px solid #000;text-align:center;">{{ $r->no_po_customer ?? '-' }}</td>
-        <td style="border:1px solid #000;">{{ $supplier }}</td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($hppSatuan) : $fmtBrowser($hppSatuan) }}
-        </td>
-        <td style="border:1px solid #000;text-align:center;">{{ $r->no_so }}</td>
-        <td style="border:1px solid #000;">{{ $r->nama_customer }}</td>
-        <td style="border:1px solid #000;text-align:center;">{{ $r->penerima }}</td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->harga_so) : $fmtBrowser($r->harga_so) }}
-        </td>
-        <td style="border:1px solid #000;text-align:center;">{{ date('d/m/Y', strtotime($r->tgl_sj)) }}</td>
-        <td style="border:1px solid #000;text-align:center;">{{ $r->no_polisi }}</td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->berat_sj) : number_format($r->berat_sj,0,',','.') }}
-        </td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->berat_si) : number_format($r->berat_si,0,',','.') }}
-        </td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->berat_net) : number_format($r->berat_net,0,',','.') }}
-        </td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->harga_net) : $fmtBrowser($r->harga_net) }}
-        </td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($r->total_si) : $fmtBrowser($r->total_si) }}
-        </td>
-        <td style="border:1px solid #000;text-align:right;{{ $isExcelExport ? $cellNumberStyle : '' }}">
-          {{ $isExcelExport ? $fmtExportPlain($totalHpp) : $fmtBrowser($totalHpp) }}
-        </td>
-      </tr>
-    @endforeach
+      @foreach($data as $row)
+        @php
+          $beratMasuk  = (float)($row->berat_masuk ?? 0);
+          $beratKeluar = (float)($row->berat_keluar ?? 0);
+        @endphp
+        <tr>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">{{ $row->row_number }}</td>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">{{ \Carbon\Carbon::parse($row->tanggal)->format('d/m/Y') }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->no_referensi ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_gudang ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_kavling ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;font-size:10px;">{{ $row->nama_supplier_customer ?? '-' }}</td>
+          <td style="border:1px solid #000;padding:4px;text-align:center;font-size:10px;">
+            {{ isset($row->kadar_air) ? rtrim(rtrim(number_format((float)$row->kadar_air, 1, ',', ''), '0'), ',') : '' }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($beratMasuk) : number_format($beratMasuk, 0, ',', '.') }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($beratKeluar) : number_format($beratKeluar, 0, ',', '.') }}
+          </td>
+          <td style="border:1px solid #000;text-align:right;padding:4px;font-size:10px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+            {{ $isExcelExport ? $fmtExportPlain($row->calculated_balance) : number_format($row->calculated_balance, 0, ',', '.') }}
+          </td>
+        </tr>
+      @endforeach
     </tbody>
   </table>
 </div>
