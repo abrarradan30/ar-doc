@@ -1,0 +1,212 @@
+@php
+$req = app()->request;
+$helper = getCore('Helper');
+$date_now = date('d/m/Y H:i:s');
+
+// ================= EXPORT HANDLING =================
+$exportParam = strtolower((string)($req->get('export') ?? ''));
+$isExcelExport = in_array($exportParam, ['xls','xlsx','excel','csv'], true);
+
+$fmtBrowser = function ($v) {
+    $v = (float)($v ?? 0);
+    $neg = $v < 0;
+    $abs = (int)abs($v);
+    $s = 'Rp ' . number_format($abs, 0, ',', '.');
+    return $neg ? "({$s})" : $s;
+};
+
+$fmtExportPlain = fn ($v) => (int)round((float)($v ?? 0));
+$cellNumberStyle = "mso-number-format:'\\0022Rp\\0022 #,##0';";
+
+// ================= FILTER =================
+$customerId = $req->get('customer_id');
+
+// ==================================================
+// 1️⃣ SUBQUERY: SALES INVOICE NON-TRADING (POST)
+// ==================================================
+$aggSid = \DB::table('t_sales_invoice as si')
+    ->join('t_sales_invoice_d as sid', 'sid.t_sales_invoice_id', '=', 'si.id')
+    ->select(
+        'si.t_sales_order_id',
+        \DB::raw('SUM(sid.berat_si) as total_berat_si_sid')
+    )
+    ->where('si.status', 'POST')
+    ->groupBy('si.t_sales_order_id');
+
+// ==================================================
+// 2️⃣ SUBQUERY: SALES INVOICE TRADING (POST)
+// ==================================================
+$aggSitd = \DB::table('t_sales_invoice as si')
+    ->join('t_sales_invoice_trading_d as sitd', 'sitd.t_sales_invoice_id', '=', 'si.id')
+    ->select(
+        'si.t_sales_order_id',
+        \DB::raw('SUM(sitd.berat_si) as total_berat_si_sitd')
+    )
+    ->where('si.status', 'POST')
+    ->groupBy('si.t_sales_order_id');
+
+// ===================================================================
+// 3️⃣ SUBQUERY: SURAT JALAN DRAFT / POST YANG BELUM MASUK SALES INVOICE
+// ===================================================================
+$aggSjOutstanding = \DB::table('t_surat_jalan as sj')
+    ->select(
+        'sj.t_sales_order_id',
+        \DB::raw('SUM(sj.berat_kirim) as total_berat_sj_outstanding')
+    )
+    ->whereIn('sj.status', ['DRAFT', 'POST'])
+    ->whereNotExists(function ($q) {
+        $q->select(\DB::raw(1))
+          ->from('t_sales_invoice_d as sid')
+          ->whereColumn('sid.t_surat_jalan_id', 'sj.id');
+    })
+    ->groupBy('sj.t_sales_order_id');
+
+// ==================================================
+// 4️⃣ GABUNGAN TOTAL BERAT KIRIM (FINAL)
+// ==================================================
+$aggBeratKirim = \DB::table('t_sales_order as so')
+    ->leftJoinSub($aggSid, 'agg_sid', fn ($j) => $j->on('agg_sid.t_sales_order_id', '=', 'so.id'))
+    ->leftJoinSub($aggSitd, 'agg_sitd', fn ($j) => $j->on('agg_sitd.t_sales_order_id', '=', 'so.id'))
+    ->leftJoinSub($aggSjOutstanding, 'agg_sj', fn ($j) => $j->on('agg_sj.t_sales_order_id', '=', 'so.id'))
+    ->select(
+        'so.id as t_sales_order_id',
+        \DB::raw('
+            COALESCE(agg_sid.total_berat_si_sid, 0)
+          + COALESCE(agg_sitd.total_berat_si_sitd, 0)
+          + COALESCE(agg_sj.total_berat_sj_outstanding, 0)
+          AS total_berat_kirim
+        ')
+    );
+
+// ==================================================
+// 5️⃣ SUBQUERY: INVOICE TERAKHIR (UNTUK SISA DP)
+// ==================================================
+$lastInvoice = \DB::table('t_sales_invoice as si')
+    ->select(
+        'si.t_sales_order_id',
+        \DB::raw('MAX(si.id) as last_invoice_id')
+    )
+    ->where('si.status', 'POST')
+    ->groupBy('si.t_sales_order_id');
+
+// ==================================================
+// 6️⃣ QUERY UTAMA LAPORAN
+// ==================================================
+$data = \DB::table('t_sales_order as so')
+    ->leftJoin('m_customer as cust', 'so.m_customer_id', '=', 'cust.id')
+    ->leftJoin('m_item as item', 'so.m_item_id', '=', 'item.id')
+    ->leftJoinSub($aggBeratKirim, 'agg_kirim', fn ($j) => $j->on('agg_kirim.t_sales_order_id','=','so.id'))
+    ->leftJoinSub($lastInvoice, 'li', fn ($j) => $j->on('li.t_sales_order_id','=','so.id'))
+    ->leftJoin('t_sales_invoice as si_last', 'si_last.id', '=', 'li.last_invoice_id')
+    ->select(
+        'so.id',
+        'so.no_so',
+        'so.tgl as tanggal_so',
+        'so.no_po_customer',
+        'so.berat as berat_so',
+        'so.harga',
+        'so.penerima',
+        'cust.nama as customer_nama',
+        'item.nama_item',
+
+        \DB::raw('COALESCE(agg_kirim.total_berat_kirim,0) as berat_kirim'),
+        \DB::raw('GREATEST(COALESCE(so.berat,0) - COALESCE(agg_kirim.total_berat_kirim,0),0) as sisa_so'),
+
+        \DB::raw("(
+            CASE 
+                WHEN EXISTS(
+                    SELECT 1 FROM t_sales_order_h h
+                    WHERE h.t_sales_order_id=so.id
+                    AND h.is_kunci=true
+                    AND h.dp < 0
+                ) THEN 0
+                ELSE COALESCE((
+                    SELECT si2.sisa_dp
+                    FROM t_sales_invoice si2
+                    WHERE si2.t_sales_order_id=so.id
+                    AND si2.status='POST'
+                    ORDER BY si2.tgl DESC, si2.id DESC
+                    LIMIT 1
+                ), (
+                    SELECT GREATEST(COALESCE(SUM(h.dp),0),0)
+                    FROM t_sales_order_h h
+                    WHERE h.t_sales_order_id=so.id
+                    AND h.is_kunci=true
+                    AND h.is_status=true
+                ),0)
+            END
+        ) as sisa_dp")
+    )
+    ->where('so.status_transaksi', 'PROCESS')
+    ->when($customerId, fn ($q) => $q->where('cust.id', $customerId))
+    ->when($req->periode_from, fn ($q) => $q->whereDate('so.tgl','>=',date('Y-m-d',strtotime($req->periode_from))))
+    ->when($req->periode_to, fn ($q) => $q->whereDate('so.tgl','<=',date('Y-m-d',strtotime($req->periode_to))))
+    ->orderBy('so.id', $req->sort_id == 'terbesar_id' ? 'desc' : 'asc')
+    ->get();
+@endphp
+
+<div style="text-align: center;">
+  <h1 style="font-size: 14px; font-weight: bold;">Laporan Sales Order Outstanding</h1>
+  <p style="font-size: 10px;"> Periode : {{@$req->periode_from ? $helper->formatDateId(@$req->periode_from) : '-'}} {{@$req->periode_to ? '- ' . $helper->formatDateId(@$req->periode_to) : ''}}</p>
+</div>
+
+<table style="border: 1px solid black; border-collapse: collapse; font-size: 9px; width: 100%;">
+  <thead>
+    <tr style="background-color: #f2f2f2; font-weight: bold; text-align: center;">
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">No</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Tanggal</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">No SO</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Nama Customer</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">KA (%)</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Harga</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Berat SO</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Berat Kirim</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Sisa SO</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Sisa DP</th>
+      <th style="border: 1px solid black; text-align: center; vertical-align: middle;">Penerima</th>
+    </tr>
+  </thead>
+  <tbody>
+    @if(request()->filled('so_id') && $data->isEmpty())
+      <tr>
+        <td colspan="11" style="text-align: center; font-style: italic;">No data to show!</td>
+      </tr>
+    @elseif($data->isEmpty())
+      <tr>
+        <td colspan="11" style="text-align: center; font-style: italic;">Silakan pilih filter untuk melihat data.</td>
+      </tr>
+    @else
+      @foreach ($data as $index => $row)
+      <tr>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">{{ $index + 1 }}</td>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">
+          {{ \Carbon\Carbon::parse($row->tanggal_so)->format('d/m/Y') }}
+        </td>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">{{ $row->no_so }}</td>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">{{ $row->customer_nama ?? '-' }}</td>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">{{ $row->nama_item ?? '-' }}</td>
+        <td style="border:1px solid #000;text-align:right;vertical-align:middle;padding-right:3px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($row->harga ?? 0) : $fmtBrowser($row->harga ?? 0) }}
+        </td>
+
+        <td style="border:1px solid #000;text-align:right;vertical-align:middle;padding-right:3px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($row->berat_so ?? 0) : number_format((float)($row->berat_so ?? 0), 0, ',', '.') }}
+        </td>
+
+        <td style="border:1px solid #000;text-align:right;vertical-align:middle;padding-right:3px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($row->berat_kirim ?? 0) : number_format((float)($row->berat_kirim ?? 0), 0, ',', '.') }}
+        </td>
+
+        <td style="border:1px solid #000;text-align:right;vertical-align:middle;padding-right:3px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($row->sisa_so ?? 0) : number_format((float)($row->sisa_so ?? 0), 0, ',', '.') }}
+        </td>
+
+        <td style="border:1px solid #000;text-align:right;vertical-align:middle;padding-right:3px;{{ $isExcelExport ? $cellNumberStyle : '' }}">
+          {{ $isExcelExport ? $fmtExportPlain($row->sisa_dp ?? 0) : $fmtBrowser($row->sisa_dp ?? 0) }}
+        </td>
+        <td style="border: 1px solid black; text-align: center; vertical-align: middle;">{{ $row->penerima ?? '-' }}</td>
+      </tr>
+      @endforeach
+    @endif
+  </tbody>
+</table>
