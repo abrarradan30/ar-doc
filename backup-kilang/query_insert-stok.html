@@ -1,0 +1,209 @@
+// tambahan (hasil penggilingan)
+INSERT INTO kartu_stok (
+    m_item_id,
+    m_gudang_id,
+    date,
+    date_trx,
+    tipe_transaksi,
+    qty_masuk,
+    qty_keluar,
+    saldo_awal,
+    saldo_akhir,
+    harga_pokok,
+    keterangan,
+    referensi_table,
+    referensi_id,
+    created_at,
+    updated_at
+)
+SELECT
+    d.m_item_id,
+    COALESCE(NULLIF(d.gudang_id,0),1),
+    p.date,
+    p.date,
+    'KELUAR',
+    0,
+    d.qty,
+    COALESCE(ks.saldo_akhir,0),
+    COALESCE(ks.saldo_akhir,0) - d.qty,
+    COALESCE(hpp.harga_pokok,0),
+    'POST Penggunaan Bahan Tambahan Produksi: ' || p.no,
+    't_pres',
+    p.id,
+    now(),
+    now()
+FROM t_pres_d_bahan_tambahan d
+JOIN t_pres p ON p.id = d.t_pres_id
+LEFT JOIN LATERAL (
+    SELECT saldo_akhir
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) ks ON true
+LEFT JOIN LATERAL (
+    SELECT harga_pokok
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+      AND tipe_transaksi = 'MASUK'
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) hpp ON true
+WHERE d.id = :detail_id
+  AND d.qty > 0;
+
+// retur (hasil penggilingan)
+INSERT INTO kartu_stok (
+    m_item_id,
+    m_gudang_id,
+    date,
+    date_trx,
+    tipe_transaksi,
+    qty_masuk,
+    qty_keluar,
+    saldo_awal,
+    saldo_akhir,
+    harga_pokok,
+    keterangan,
+    referensi_table,
+    referensi_id,
+    created_at,
+    updated_at
+)
+SELECT
+    d.m_item_id,
+    4,
+    p.date,
+    p.date,
+    'KELUAR',
+    0,
+    d.qty,
+    COALESCE(ks.saldo_akhir,0),
+    COALESCE(ks.saldo_akhir,0) - d.qty,
+    COALESCE(hpp.harga_pokok,0),
+    'POST Retur Bahan Tambahan Produksi: ' || p.no,
+    't_pres',
+    p.id,
+    now(),
+    now()
+FROM t_pres_d_bahan_tambahan_retur d
+JOIN t_pres p ON p.id = d.t_pres_id
+LEFT JOIN LATERAL (
+    SELECT saldo_akhir
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = 4
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) ks ON true
+LEFT JOIN LATERAL (
+    SELECT harga_pokok
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = 4
+      AND tipe_transaksi = 'MASUK'
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) hpp ON true
+WHERE d.id = :detail_id
+  AND d.qty > 0;
+
+// hasil (hasil penggilingan)
+INSERT INTO kartu_stok (
+    m_item_id,
+    m_gudang_id,
+    date,
+    date_trx,
+    tipe_transaksi,
+    qty_masuk,
+    qty_keluar,
+    saldo_awal,
+    saldo_akhir,
+    harga_pokok,
+    keterangan,
+    referensi_table,
+    referensi_id,
+    created_at,
+    updated_at,
+    pending
+)
+SELECT
+    d.m_item_id,
+    COALESCE(NULLIF(d.gudang_id,0),1),
+    p.date,
+    p.date,
+    'MASUK',
+    d.qty,
+    0,
+    COALESCE(ks.saldo_akhir,0),
+    COALESCE(ks.saldo_akhir,0) + d.qty,
+    0,
+    'POST Hasil Produksi: ' || p.no,
+    't_pres',
+    p.id,
+    now(),
+    now(),
+    false
+FROM t_pres_d_hasil d
+JOIN t_pres p ON p.id = d.t_pres_id
+LEFT JOIN LATERAL (
+    SELECT saldo_akhir
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) ks ON true
+WHERE d.id = :detail_id
+  AND d.qty > 0;
+
+// hasil sampingan (hasil penggilingan)
+INSERT INTO kartu_stok (
+    m_item_id,
+    m_gudang_id,
+    date,
+    date_trx,
+    tipe_transaksi,
+    qty_masuk,
+    qty_keluar,
+    saldo_awal,
+    saldo_akhir,
+    harga_pokok,
+    keterangan,
+    referensi_table,
+    referensi_id,
+    created_at,
+    updated_at,
+    pending
+)
+SELECT
+    d.m_item_id,
+    COALESCE(NULLIF(d.gudang_id,0),1),
+    p.date,
+    p.date,
+    'MASUK',
+    d.qty,
+    0,
+    COALESCE(ks.saldo_akhir,0),
+    COALESCE(ks.saldo_akhir,0) + d.qty,
+    0,
+    'POST Hasil Produksi Sampingan: ' || p.no,
+    't_pres',
+    p.id,
+    now(),
+    now(),
+    false
+FROM t_pres_d_sampingan d
+JOIN t_pres p ON p.id = d.t_pres_id
+LEFT JOIN LATERAL (
+    SELECT saldo_akhir
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) ks ON true
+WHERE d.id = :detail_id
+  AND d.qty > 0;
