@@ -131,28 +131,31 @@ INSERT INTO kartu_stok (
 )
 SELECT
     d.m_item_id,
-    COALESCE(NULLIF(d.gudang_id,0),1),
+    COALESCE(NULLIF(d.gudang_id, 0), 1),
     p.date,
     p.date,
     'MASUK',
     d.qty,
     0,
-    COALESCE(ks.saldo_akhir,0),
-    COALESCE(ks.saldo_akhir,0) + d.qty,
+    COALESCE(ks.saldo_akhir, 0),
+    COALESCE(ks.saldo_akhir, 0) + d.qty,
     0,
     'POST Hasil Produksi: ' || p.no,
     't_pres',
     p.id,
     now(),
     now(),
-    false
+    CASE
+        WHEN p.status = 'PENDING' THEN true
+        ELSE false
+    END
 FROM t_pres_d_hasil d
 JOIN t_pres p ON p.id = d.t_pres_id
 LEFT JOIN LATERAL (
     SELECT saldo_akhir
     FROM kartu_stok
-    WHERE m_item_id = d.m_item_id
-      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+    WHERE m_item_id   = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id, 0), 1)
     ORDER BY date_trx DESC, id DESC
     LIMIT 1
 ) ks ON true
@@ -180,14 +183,14 @@ INSERT INTO kartu_stok (
 )
 SELECT
     d.m_item_id,
-    COALESCE(NULLIF(d.gudang_id,0),1),
+    COALESCE(NULLIF(d.gudang_id, 0), 1),
     p.date,
     p.date,
     'MASUK',
     d.qty,
     0,
-    COALESCE(ks.saldo_akhir,0),
-    COALESCE(ks.saldo_akhir,0) + d.qty,
+    COALESCE(ks.saldo_akhir, 0),
+    COALESCE(ks.saldo_akhir, 0) + d.qty,
     0,
     'POST Hasil Produksi Sampingan: ' || p.no,
     't_pres',
@@ -200,8 +203,8 @@ JOIN t_pres p ON p.id = d.t_pres_id
 LEFT JOIN LATERAL (
     SELECT saldo_akhir
     FROM kartu_stok
-    WHERE m_item_id = d.m_item_id
-      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id,0),1)
+    WHERE m_item_id   = d.m_item_id
+      AND m_gudang_id = COALESCE(NULLIF(d.gudang_id, 0), 1)
     ORDER BY date_trx DESC, id DESC
     LIMIT 1
 ) ks ON true
