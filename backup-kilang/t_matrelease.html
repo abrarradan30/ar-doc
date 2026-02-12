@@ -1,0 +1,749 @@
+// insert-upsert kartu stok by BPB (11 Feb 2026)
+public function insert_kartu_stok_from_bkpb($id, $creatorId = null)
+{
+    DB::beginTransaction();
+    try {
+
+        // ==========================
+        // CUSTOM ROUND (3 decimal)
+        // ==========================
+        if (!function_exists('customRound3')) {
+            function customRound3($value)
+            {
+                $mult    = 1000;              // 3 decimal
+                $scaled  = $value * $mult;    // shift
+                $floor   = floor($scaled);    // angka bawah
+                $decimal = $scaled - $floor;  // nilai koma
+
+                // aturan pembulatan custom:
+                // 0.6 - 0.9 → ceil (naik)
+                // 0.1 - 0.5 → floor (turun)
+                if ($decimal >= 0.6) {
+                    return ceil($scaled) / $mult;
+                } else {
+                    return floor($scaled) / $mult;
+                }
+            }
+        }
+
+        // ==========================
+        // LOAD HEADER
+        // ==========================
+        $gudang = DB::table("m_gudang")->where("code", "GDG-0001")->first();
+        if (!$gudang) {
+            throw new \Exception("Gudang dengan code 'GDG-0001' tidak ditemukan");
+        }
+
+        $tmatre = DB::table("t_matrelease")->find($id);
+        if (!$tmatre) {
+            throw new \Exception("Data t_matrelease id:$id tidak ditemukan");
+        }
+
+        if (empty($tmatre->date)) {
+            throw new \Exception("date_trx tidak boleh kosong pada t_matrelease id=$id");
+        }
+
+        $dateTrxHeader = \Carbon\Carbon::parse($tmatre->date);
+        $now           = \Carbon\Carbon::now();
+        $gudangId      = (int) $gudang->id;
+
+        // HPP & nilai tambahan dari HEADER
+        $hppFinalHeader    = (float) ($tmatre->hpp_final ?? 0);              // HPP per KG (header)
+        $refTambahanHeader = (float) ($tmatre->ref_jumlah_total_tamb ?? 0);  // total nilai uang tambahan (header)
+
+        $detailBaku     = DB::table("t_matrelease_d_bahan_baku")->where("t_matrelease_id", $id)->get();
+        $detailTambahan = DB::table("t_matrelease_d_bahan_tambahan")->where("t_matrelease_id", $id)->get();
+        $detailHasil    = DB::table("t_matrelease_d_hasil")->where("t_matrelease_id", $id)->get();
+
+        if ($detailBaku->isEmpty() && $detailTambahan->isEmpty() && $detailHasil->isEmpty()) {
+            throw new \Exception("Tidak ada detail pada t_matrelease id:$id");
+        }
+
+        // prev stock / harga pokok
+        $getPrevStock = fn($item, $gudang, $tgl) => DB::table("kartu_stok")
+            ->where("m_item_id", $item)
+            ->where("m_gudang_id", $gudang)
+            ->whereNotNull("date_trx")
+            ->where("date_trx", "<=", $tgl)
+            ->orderBy("date_trx", "desc")
+            ->orderBy("id", "desc")
+            ->lockForUpdate()
+            ->first();
+
+        $getHargaPokok = fn($item, $gudang, $tgl) =>
+            (float) (DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudang)
+                ->where("tipe_transaksi", "MASUK")
+                ->whereNotNull("date_trx")
+                ->where("date_trx", "<=", $tgl)
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->value("harga_pokok") ?? 0);
+
+        // RECALCULATE SALDO SETELAH INSERT / UPDATE
+        $recompute = function ($item, $gudang, $tgl, $insertId, $saldoAkhirAwal) {
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudang)
+                ->where(function ($q) use ($tgl, $insertId) {
+                    $q->where("date_trx", ">", $tgl)
+                        ->orWhere(function ($q2) use ($tgl, $insertId) {
+                            $q2->where("date_trx", "=", $tgl)
+                                ->where("id", ">", $insertId);
+                        });
+                })
+                ->orderBy("date_trx")
+                ->orderBy("id")
+                ->lockForUpdate()
+                ->get();
+
+            $saldo = $saldoAkhirAwal;
+            foreach ($rows as $r) {
+                $awal  = $saldo;
+                $akhir = $awal + (float)$r->qty_masuk - (float)$r->qty_keluar;
+
+                DB::table("kartu_stok")->where("id", $r->id)->update([
+                    "saldo_awal"  => $awal,
+                    "saldo_akhir" => $akhir,
+                    "updated_at"  => \Carbon\Carbon::now(),
+                ]);
+
+                $saldo = $akhir;
+            }
+        };
+
+        $insertCount = 0;
+
+        // ===================================================================
+        // 1) KELUAR BAHAN BAKU
+        // ===================================================================
+        foreach ($detailBaku as $r) {
+            $item = (int) $r->m_item_id;
+            $qty  = (float) ($r->jumlah_qty_terpakai ?? 0);
+            if ($qty <= 0) continue;
+
+            $prev       = $getPrevStock($item, $gudangId, $dateTrxHeader);
+            $saldoAwal  = $prev->saldo_akhir ?? 0;
+            $saldoAkhir = $saldoAwal - $qty;
+            $harga      = $getHargaPokok($item, $gudangId, $dateTrxHeader);
+
+            $newId = DB::table("kartu_stok")->insertGetId([
+                "m_item_id"       => $item,
+                "date"            => $dateTrxHeader,
+                "date_trx"        => $dateTrxHeader,
+                "tipe_transaksi"  => "KELUAR",
+                "qty_masuk"       => 0,
+                "qty_keluar"      => $qty,
+                "saldo_awal"      => $saldoAwal,
+                "saldo_masuk"     => 0,
+                "harga_pokok"     => $harga,
+                "keterangan"      => "POST Bukti Pengeluaran Bahan: " . ($tmatre->no ?? $id),
+                "referensi_id"    => $id,
+                "referensi_table" => "t_matrelease",
+                "creator_id"      => $creatorId,
+                "editor_id"       => null,
+                "created_at"      => $now,
+                "updated_at"      => $now,
+                "m_gudang_id"     => $gudangId,
+                "saldo_akhir"     => $saldoAkhir,
+                "modal_kg"        => 0,
+                "harga_sak"       => 0,
+                "nilai_uang"      => 0,
+            ]);
+
+            $recompute($item, $gudangId, $dateTrxHeader, $newId, $saldoAkhir);
+            $insertCount++;
+        }
+
+        // ===================================================================
+        // 2) KELUAR BAHAN TAMBAHAN
+        // ===================================================================
+        foreach ($detailTambahan as $r) {
+            $item = (int) $r->m_item_id;
+            $qty  = (float) ($r->qty ?? 0);
+            if ($qty <= 0) continue;
+
+            $gudangIdRow = (int) ($r->gudang_id ?? $gudangId);
+
+            $prev       = $getPrevStock($item, $gudangIdRow, $dateTrxHeader);
+            $saldoAwal  = $prev->saldo_akhir ?? 0;
+            $saldoAkhir = $saldoAwal - $qty;
+            $harga      = $getHargaPokok($item, $gudangIdRow, $dateTrxHeader);
+
+            $newId = DB::table("kartu_stok")->insertGetId([
+                "m_item_id"       => $item,
+                "date"            => $dateTrxHeader,
+                "date_trx"        => $dateTrxHeader,
+                "tipe_transaksi"  => "KELUAR",
+                "qty_masuk"       => 0,
+                "qty_keluar"      => $qty,
+                "saldo_awal"      => $saldoAwal,
+                "saldo_masuk"     => 0,
+                "harga_pokok"     => $harga,
+                "keterangan"      => "POST Bukti Pengeluaran Bahan Tambahan: " . ($tmatre->no ?? $id),
+                "referensi_id"    => $id,
+                "referensi_table" => "t_matrelease",
+                "creator_id"      => $creatorId,
+                "editor_id"       => null,
+                "created_at"      => $now,
+                "updated_at"      => $now,
+                "m_gudang_id"     => $gudangIdRow,
+                "saldo_akhir"     => $saldoAkhir,
+                "modal_kg"        => 0,
+                "harga_sak"       => 0,
+                "nilai_uang"      => 0,
+            ]);
+
+            $recompute($item, $gudangIdRow, $dateTrxHeader, $newId, $saldoAkhir);
+            $insertCount++;
+        }
+
+        // ===================================================================
+        // 3) HASIL PRODUKSI — MASUK (UPDATE HPP AVERAGE)  ✅ FIXED
+        // ===================================================================
+        foreach ($detailHasil as $r) {
+
+            $item     = (int) $r->m_item_id;
+            $qtyHasil = (float) ($r->qty ?? 0);
+            if ($qtyHasil <= 0) continue;
+
+            $presId = $r->t_pres_id;
+
+            // BARIS MASUK (batch sekarang)
+            $rowMasuk = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->where("tipe_transaksi", "MASUK")
+                ->where("referensi_table", "t_pres")
+                ->where("referensi_id", $presId)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->first();
+
+            if (!$rowMasuk) continue;
+
+            // MASUK SEBELUMNYA (untuk ambil HPP lama)
+            $rowMasukPrev = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->where("tipe_transaksi", "MASUK")
+                ->whereNotNull("date_trx")
+                ->where(function ($q) use ($rowMasuk) {
+                    $q->where("date_trx", "<", $rowMasuk->date_trx)
+                    ->orWhere(function ($q2) use ($rowMasuk) {
+                        $q2->where("date_trx", "=", $rowMasuk->date_trx)
+                            ->where("id", "<", $rowMasuk->id);
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->lockForUpdate()
+                ->first();
+
+            // TRANSAKSI TERAKHIR (saldo sebelum batch)
+            $lastTransBefore = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->whereNotNull("date_trx")
+                ->where(function ($q) use ($rowMasuk) {
+                    $q->where("date_trx", "<", $rowMasuk->date_trx)
+                    ->orWhere(function ($q2) use ($rowMasuk) {
+                        $q2->where("date_trx", "=", $rowMasuk->date_trx)
+                            ->where("id", "<", $rowMasuk->id);
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->lockForUpdate()
+                ->first();
+
+            // ==========================
+            // MASTER ITEM & KONVERSI
+            // ==========================
+            $itemMaster = DB::table("m_item")->where("id", $item)->first();
+            $convMaster = (float) ($itemMaster->conv ?? 1);
+            if ($convMaster <= 0) $convMaster = 1;
+
+            // ==========================
+            // QTY & HPP
+            // ==========================
+            $qtyBaru = (float) ($rowMasuk->qty_masuk ?? $qtyHasil);
+            $qtyLama = $lastTransBefore ? (float)$lastTransBefore->saldo_akhir : 0;
+
+            $hppLama = $rowMasukPrev ? (float)$rowMasukPrev->harga_pokok : 0;
+
+            // HPP batch baru
+            $hppBaruPerSak = $hppFinalHeader * $convMaster;
+            $totalBaru     = $qtyBaru * $hppBaruPerSak;
+            $qtyAkhir      = $qtyLama + $qtyBaru;
+
+            // ==========================
+            // 🔥 FIX UTAMA DI SINI
+            // ==========================
+            if ($qtyLama <= 0) {
+                // STOK HABIS → RESET HPP
+                $hppAvgRaw = $hppBaruPerSak;
+            } else {
+                $totalLama = $qtyLama * $hppLama;
+                $hppAvgRaw = ($totalLama + $totalBaru) / $qtyAkhir;
+            }
+
+            $hppAvg = customRound3($hppAvgRaw);
+
+            // nilai tambahan header
+            $modalKg   = customRound3($hppFinalHeader);
+            $hargaSak  = customRound3($hppFinalHeader * $convMaster);
+            $nilaiUang = customRound3($refTambahanHeader);
+
+            // UPDATE BARIS MASUK
+            DB::table("kartu_stok")
+                ->where("id", $rowMasuk->id)
+                ->update([
+                    "saldo_awal"  => $qtyLama,
+                    "saldo_akhir" => $qtyAkhir,
+                    "harga_pokok" => $hppAvg,
+                    "modal_kg"    => $modalKg,
+                    "harga_sak"   => $hargaSak,
+                    "nilai_uang"  => $nilaiUang,
+                    "pending"     => false,
+                    "updated_at"  => $now,
+                    "editor_id"   => $creatorId,
+                ]);
+
+            // recompute setelahnya
+            $recompute($item, $gudangId, $dateTrxHeader, $rowMasuk->id, $qtyAkhir);
+
+            $insertCount++;
+        }
+
+        if ($insertCount === 0) {
+            throw new \Exception("Tidak ada data stok valid.");
+        }
+
+        DB::commit();
+        Log::info("Insert kartu stok sukses (recalc trail) untuk t_matrelease id: $id", [
+            "total_insert"      => $insertCount,
+            "gudang_default_id" => $gudangId,
+        ]);
+
+        return ["success" => true, "message" => "Insert kartu stok berhasil"];
+
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        Log::error("Insert kartu stok gagal", ["id" => $id, "error" => $e->getMessage()]);
+        return ["success" => false, "message" => $e->getMessage()];
+    }
+}
+
+public function upsert_kartu_stok_from_bkpb($id, $creatorId = null)
+{
+    DB::beginTransaction();
+    try {
+        // ==========================
+        // CUSTOM ROUND (3 decimal)
+        // ==========================
+        if (!function_exists('customRound3')) {
+            function customRound3($value)
+            {
+                $mult    = 1000;              // 3 decimal
+                $scaled  = $value * $mult;    // shift
+                $floor   = floor($scaled);    // angka bawah
+                $decimal = $scaled - $floor;  // nilai koma
+
+                // aturan pembulatan custom:
+                // 0.6 - 0.9 → ceil (naik)
+                // 0.1 - 0.5 → floor (turun)
+                if ($decimal >= 0.6) {
+                    return ceil($scaled) / $mult;
+                } else {
+                    return floor($scaled) / $mult;
+                }
+            }
+        }
+
+        // ==========================
+        // LOAD HEADER
+        // ==========================
+        $gudang = DB::table("m_gudang")->where("code", "GDG-0001")->first();
+        if (!$gudang) {
+            throw new \Exception("Gudang dengan code 'GDG-0001' tidak ditemukan");
+        }
+
+        $tmatre = DB::table("t_matrelease")->find($id);
+        if (!$tmatre) {
+            throw new \Exception("Data t_matrelease id:$id tidak ditemukan");
+        }
+
+        if (empty($tmatre->date)) {
+            throw new \Exception("date_trx tidak boleh kosong pada t_matrelease id=$id");
+        }
+
+        $dateTrxHeader = \Carbon\Carbon::parse($tmatre->date);
+        $now           = \Carbon\Carbon::now();
+        $gudangId      = (int) $gudang->id;
+
+        $hppFinalHeader    = (float) ($tmatre->hpp_final ?? 0);
+        $refTambahanHeader = (float) ($tmatre->ref_jumlah_total_tamb ?? 0);
+
+        $detailBaku     = DB::table("t_matrelease_d_bahan_baku")->where("t_matrelease_id", $id)->get();
+        $detailTambahan = DB::table("t_matrelease_d_bahan_tambahan")->where("t_matrelease_id", $id)->get();
+        $detailHasil    = DB::table("t_matrelease_d_hasil")->where("t_matrelease_id", $id)->get();
+
+        if ($detailBaku->isEmpty() && $detailTambahan->isEmpty() && $detailHasil->isEmpty()) {
+            throw new \Exception("Tidak ada detail pada t_matrelease id:$id");
+        }
+
+        // prev stock / harga pokok
+        $getPrevStock = fn($item, $gudang, $tgl) => DB::table("kartu_stok")
+            ->where("m_item_id", $item)
+            ->where("m_gudang_id", $gudang)
+            ->whereNotNull("date_trx")
+            ->where("date_trx", "<=", $tgl)
+            ->orderBy("date_trx", "desc")
+            ->orderBy("id", "desc")
+            ->lockForUpdate()
+            ->first();
+
+        $getHargaPokok = fn($item, $gudang, $tgl) =>
+            (float) (DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudang)
+                ->where("tipe_transaksi", "MASUK")
+                ->whereNotNull("date_trx")
+                ->where("date_trx", "<=", $tgl)
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->value("harga_pokok") ?? 0);
+
+        // RECALCULATE SALDO SETELAH INSERT / UPDATE
+        $recompute = function ($item, $gudang, $tgl, $startRowId, $saldoAkhirAwal) {
+            $rows = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudang)
+                ->where(function ($q) use ($tgl, $startRowId) {
+                    $q->where("date_trx", ">", $tgl)
+                        ->orWhere(function ($q2) use ($tgl, $startRowId) {
+                            $q2->where("date_trx", "=", $tgl)
+                                ->where("id", ">", $startRowId);
+                        });
+                })
+                ->orderBy("date_trx")
+                ->orderBy("id")
+                ->lockForUpdate()
+                ->get();
+
+            $saldo = $saldoAkhirAwal;
+            foreach ($rows as $r) {
+                $awal  = $saldo;
+                $akhir = $awal + (float)$r->qty_masuk - (float)$r->qty_keluar;
+
+                DB::table("kartu_stok")->where("id", $r->id)->update([
+                    "saldo_awal"  => $awal,
+                    "saldo_akhir" => $akhir,
+                    "updated_at"  => \Carbon\Carbon::now(),
+                ]);
+
+                $saldo = $akhir;
+            }
+        };
+
+        $upsertCount = 0;
+
+        // Helper untuk UPDATE/INSERT baris KELUAR (bahan baku / tambahan)
+        $upsertKeluar = function (
+            int   $item,
+            int   $gudangIdX,
+            float $qty,
+            float $harga,
+            string $ketPrefix
+        ) use ($id, $tmatre, $dateTrxHeader, $now, $creatorId, $recompute) {
+
+            if ($qty <= 0) return;
+
+            // Cari existing row t_matrelease untuk item + gudang + tipe KELUAR + prefix keterangan
+            $existing = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangIdX)
+                ->where("tipe_transaksi", "KELUAR")
+                ->where("referensi_table", "t_matrelease")
+                ->where("referensi_id", $id)
+                ->where("keterangan", "LIKE", $ketPrefix . "%")
+                ->orderBy("id")
+                ->lockForUpdate()
+                ->first();
+
+            if ($existing) {
+                // ========== MODE UPDATE ==========
+                // cari transaksi sebelum existing row → untuk saldo_awal baru
+                $prev = DB::table("kartu_stok")
+                    ->where("m_item_id", $item)
+                    ->where("m_gudang_id", $gudangIdX)
+                    ->whereNotNull("date_trx")
+                    ->where(function ($q) use ($existing) {
+                        $q->where("date_trx", "<", $existing->date_trx)
+                            ->orWhere(function ($q2) use ($existing) {
+                                $q2->where("date_trx", "=", $existing->date_trx)
+                                    ->where("id", "<", $existing->id);
+                            });
+                    })
+                    ->orderBy("date_trx", "desc")
+                    ->orderBy("id", "desc")
+                    ->lockForUpdate()
+                    ->first();
+
+                $saldoAwal  = $prev ? (float)$prev->saldo_akhir : 0;
+                $saldoAkhir = $saldoAwal - $qty;
+
+                DB::table("kartu_stok")
+                    ->where("id", $existing->id)
+                    ->update([
+                        "date"            => $dateTrxHeader,
+                        "date_trx"        => $dateTrxHeader,
+                        "qty_masuk"       => 0,
+                        "qty_keluar"      => $qty,
+                        "saldo_awal"      => $saldoAwal,
+                        "saldo_masuk"     => 0,
+                        "saldo_akhir"     => $saldoAkhir,
+                        "harga_pokok"     => $harga,
+                        "keterangan"      => $ketPrefix . ": " . ($tmatre->no ?? $id),
+                        "editor_id"       => $creatorId,
+                        "updated_at"      => $now,
+                    ]);
+
+                // recompute trail setelah row ini
+                $recompute($item, $gudangIdX, $dateTrxHeader, $existing->id, $saldoAkhir);
+                return 1;
+            }
+
+            // ========== MODE INSERT (belum ada row) ==========
+            $prev       = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangIdX)
+                ->whereNotNull("date_trx")
+                ->where("date_trx", "<=", $dateTrxHeader)
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->lockForUpdate()
+                ->first();
+
+            $saldoAwal  = $prev ? (float)$prev->saldo_akhir : 0;
+            $saldoAkhir = $saldoAwal - $qty;
+
+            $newId = DB::table("kartu_stok")->insertGetId([
+                "m_item_id"       => $item,
+                "date"            => $dateTrxHeader,
+                "date_trx"        => $dateTrxHeader,
+                "tipe_transaksi"  => "KELUAR",
+                "qty_masuk"       => 0,
+                "qty_keluar"      => $qty,
+                "saldo_awal"      => $saldoAwal,
+                "saldo_masuk"     => 0,
+                "harga_pokok"     => $harga,
+                "keterangan"      => $ketPrefix . ": " . ($tmatre->no ?? $id),
+                "referensi_id"    => $id,
+                "referensi_table" => "t_matrelease",
+                "creator_id"      => $creatorId,
+                "editor_id"       => null,
+                "created_at"      => $now,
+                "updated_at"      => $now,
+                "m_gudang_id"     => $gudangIdX,
+                "saldo_akhir"     => $saldoAkhir,
+                "modal_kg"        => 0,
+                "harga_sak"       => 0,
+                "nilai_uang"      => 0,
+            ]);
+
+            $recompute($item, $gudangIdX, $dateTrxHeader, $newId, $saldoAkhir);
+            return 1;
+        };
+
+        // ===================================================================
+        // 1) KELUAR BAHAN BAKU (UPsert)
+        // ===================================================================
+        foreach ($detailBaku as $r) {
+            $item = (int) $r->m_item_id;
+            $qty  = (float) ($r->jumlah_qty_terpakai ?? 0);
+            if ($qty <= 0) continue;
+
+            $harga = $getHargaPokok($item, $gudangId, $dateTrxHeader);
+            $upsertCount += $upsertKeluar(
+                $item,
+                $gudangId,
+                $qty,
+                $harga,
+                "POST Bukti Pengeluaran Bahan"
+            );
+        }
+
+        // ===================================================================
+        // 2) KELUAR BAHAN TAMBAHAN (UPsert)
+        // ===================================================================
+        foreach ($detailTambahan as $r) {
+            $item = (int) $r->m_item_id;
+            $qty  = (float) ($r->qty ?? 0);
+            if ($qty <= 0) continue;
+
+            $gudangIdRow = (int) ($r->gudang_id ?? $gudangId);
+            $harga       = $getHargaPokok($item, $gudangIdRow, $dateTrxHeader);
+
+            $upsertCount += $upsertKeluar(
+                $item,
+                $gudangIdRow,
+                $qty,
+                $harga,
+                "POST Bukti Pengeluaran Bahan Tambahan"
+            );
+        }
+
+        // ===================================================================
+        // 3) HASIL PRODUKSI — MASUK (HPP AVERAGE)  → dari awal memang UPDATE
+        // ===================================================================
+        foreach ($detailHasil as $r) {
+
+            $item     = (int) $r->m_item_id;
+            $qtyHasil = (float) ($r->qty ?? 0);
+            if ($qtyHasil <= 0) continue;
+
+            $presId = $r->t_pres_id;
+
+            // BARIS MASUK (batch sekarang) dari t_pres
+            $rowMasuk = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->where("tipe_transaksi", "MASUK")
+                ->where("referensi_table", "t_pres")
+                ->where("referensi_id", $presId)
+                ->orderBy("date_trx", "asc")
+                ->orderBy("id", "asc")
+                ->lockForUpdate()
+                ->first();
+
+            if (!$rowMasuk) continue;
+
+            // MASUK SEBELUMNYA (untuk ambil HPP lama)
+            $rowMasukPrev = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->where("tipe_transaksi", "MASUK")
+                ->whereNotNull("date_trx")
+                ->where(function ($q) use ($rowMasuk) {
+                    $q->where("date_trx", "<", $rowMasuk->date_trx)
+                    ->orWhere(function ($q2) use ($rowMasuk) {
+                        $q2->where("date_trx", "=", $rowMasuk->date_trx)
+                            ->where("id", "<", $rowMasuk->id);
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->lockForUpdate()
+                ->first();
+
+            // TRANSAKSI TERAKHIR (saldo sebelum batch)
+            $lastTransBefore = DB::table("kartu_stok")
+                ->where("m_item_id", $item)
+                ->where("m_gudang_id", $gudangId)
+                ->whereNotNull("date_trx")
+                ->where(function ($q) use ($rowMasuk) {
+                    $q->where("date_trx", "<", $rowMasuk->date_trx)
+                    ->orWhere(function ($q2) use ($rowMasuk) {
+                        $q2->where("date_trx", "=", $rowMasuk->date_trx)
+                            ->where("id", "<", $rowMasuk->id);
+                    });
+                })
+                ->orderBy("date_trx", "desc")
+                ->orderBy("id", "desc")
+                ->lockForUpdate()
+                ->first();
+
+            // ==========================
+            // MASTER ITEM & KONVERSI
+            // ==========================
+            $itemMaster = DB::table("m_item")->where("id", $item)->first();
+            $convMaster = (float) ($itemMaster->conv ?? 1);
+            if ($convMaster <= 0) $convMaster = 1;
+
+            // ==========================
+            // QTY & HPP
+            // ==========================
+            $qtyBaru = (float) ($rowMasuk->qty_masuk ?? $qtyHasil);
+            $qtyLama = $lastTransBefore ? (float)$lastTransBefore->saldo_akhir : 0;
+
+            $hppLama = $rowMasukPrev ? (float)$rowMasukPrev->harga_pokok : 0;
+
+            // HPP batch baru
+            $hppBaruPerSak = $hppFinalHeader * $convMaster;
+            $totalBaru     = $qtyBaru * $hppBaruPerSak;
+            $qtyAkhir      = $qtyLama + $qtyBaru;
+
+            if ($qtyLama <= 0) {
+                $hppAvgRaw = $hppBaruPerSak;
+            } else {
+                $totalLama = $qtyLama * $hppLama;
+                $hppAvgRaw = ($totalLama + $totalBaru) / $qtyAkhir;
+            }
+
+            $hppAvg    = customRound3($hppAvgRaw);
+            $modalKg   = customRound3($hppFinalHeader);
+            $hargaSak  = customRound3($hppFinalHeader * $convMaster);
+            $nilaiUang = customRound3($refTambahanHeader);
+
+            // UPDATE BARIS MASUK
+            DB::table("kartu_stok")
+                ->where("id", $rowMasuk->id)
+                ->update([
+                    "saldo_awal"  => $qtyLama,
+                    "saldo_akhir" => $qtyAkhir,
+                    "harga_pokok" => $hppAvg,
+                    "modal_kg"    => $modalKg,
+                    "harga_sak"   => $hargaSak,
+                    "nilai_uang"  => $nilaiUang,
+                    "pending"     => false,
+                    "updated_at"  => $now,
+                    "editor_id"   => $creatorId,
+                ]);
+
+            // recompute setelahnya
+            $recompute($item, $gudangId, $dateTrxHeader, $rowMasuk->id, $qtyAkhir);
+
+            $upsertCount++;
+        }
+
+        if ($upsertCount === 0) {
+            throw new \Exception("Tidak ada data stok valid untuk di-upsert.");
+        }
+
+        DB::commit();
+        Log::info("Upsert kartu_stok (BKPB) sukses untuk t_matrelease id: $id", [
+            "total_upsert"      => $upsertCount,
+            "gudang_default_id" => $gudangId,
+        ]);
+
+        return ["success" => true, "message" => "Upsert kartu stok berhasil", "affected" => $upsertCount];
+
+    } catch (\Throwable $e) {
+        DB::rollBack();
+        Log::error("Upsert kartu_stok (BKPB) gagal", ["id" => $id, "error" => $e->getMessage()]);
+        return ["success" => false, "message" => $e->getMessage()];
+    }
+}
+
+// query update pending=false postgre
+UPDATE kartu_stok ks
+SET pending   = false,
+    updated_at = NOW()
+FROM (
+    -- sumber hasil produksi
+    SELECT t_pres_id
+    FROM t_matrelease_d_hasil
+    UNION
+    -- sumber sampingan produksi
+    SELECT t_pres_id
+    FROM t_matrelease_d_sampingan
+) src
+WHERE ks.referensi_table = 't_pres'
+  AND ks.tipe_transaksi  = 'MASUK'
+  AND ks.referensi_id    = src.t_pres_id
+  AND ks.date_trx <= DATE '2026-02-10'
+  AND COALESCE(ks.pending, true) = true;
