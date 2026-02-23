@@ -210,3 +210,67 @@ LEFT JOIN LATERAL (
 ) ks ON true
 WHERE d.id = :detail_id
   AND d.qty > 0;
+
+// tambahan bahan (bpb)
+INSERT INTO kartu_stok (
+    m_item_id,
+    m_gudang_id,
+    date,
+    date_trx,
+    tipe_transaksi,
+    qty_masuk,
+    qty_keluar,
+    saldo_awal,
+    saldo_akhir,
+    harga_pokok,
+    keterangan,
+    referensi_table,
+    referensi_id,
+    created_at,
+    updated_at
+)
+SELECT
+    d.m_item_id,
+    g.id AS m_gudang_id,
+    m.date,
+    m.date,
+    'KELUAR',
+    0,
+    d.qty,
+    COALESCE(ks.saldo_akhir, 0) AS saldo_awal,
+    COALESCE(ks.saldo_akhir, 0) - d.qty AS saldo_akhir,
+    COALESCE(hpp.harga_pokok, 0) AS harga_pokok,
+    'POST Bukti Pengeluaran Bahan Tambahan: ' || m.no,
+    't_matrelease',
+    m.id,
+    now(),
+    now()
+FROM t_matrelease_d_bahan_tambahan d
+JOIN t_matrelease m 
+    ON m.id = d.t_matrelease_id
+-- Gudang default GDG-0001
+JOIN m_gudang g 
+    ON g.code = 'GDG-0001'
+-- Ambil saldo terakhir sebelum tanggal transaksi
+LEFT JOIN LATERAL (
+    SELECT saldo_akhir
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = g.id
+      AND date_trx <= m.date
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) ks ON true
+-- Ambil harga pokok terakhir tipe MASUK sebelum tanggal transaksi
+LEFT JOIN LATERAL (
+    SELECT harga_pokok
+    FROM kartu_stok
+    WHERE m_item_id = d.m_item_id
+      AND m_gudang_id = g.id
+      AND tipe_transaksi = 'MASUK'
+      AND date_trx <= m.date
+    ORDER BY date_trx DESC, id DESC
+    LIMIT 1
+) hpp ON true
+WHERE d.id = :detail_id
+  AND d.qty > 0;
