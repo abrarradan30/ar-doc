@@ -1,0 +1,165 @@
+public function up()
+    {
+        DB::statement("DROP VIEW IF EXISTS {$this->viewName}");
+
+        DB::unprepared("CREATE VIEW {$this->viewName} AS
+            SELECT
+                t_pres_d_hasil.id,                          -- ID tetap penting untuk identifikasi baris
+                t_pres.id AS t_pres_id,
+                t_pres.no,                                  -- No Reference
+                t_pres.date,                                -- Tanggal
+                t_pres.desc_singkat AS desc_singkat,        -- Deskripsi Singkat
+                t_spk.batch AS batch,                       -- Batch
+                m_item.code AS code,                        -- Code Item
+                m_item.long_name AS long_name,              -- Nama Item
+                t_pres_d_hasil.qty AS qty,                  -- Qty utama
+                uom.value1 AS uom,                          -- UOM
+                t_pres_d_hasil.m_item_id,
+                t_pres_d_hasil.uom_id,                      -- id uom
+                m_item.uom_conv_id,
+                m_item.conv AS qty_conv,                    -- qty_conv
+                t_pres_d_hasil.jmlh_jumbo_bag,
+                t_pres_d_hasil.modal,
+                t_pres_d_hasil.gilingan_kecil,
+                t_pres_d_hasil.kadar_air_pct,
+                t_pres_d_hasil.susut_pct,
+                t_pres_d_hasil.ref_jumlah_total,
+                t_proses_prod.name,
+                t_pres.tipe_pres,
+                t_spk.mesin_id AS mesin_id,
+                t_pres_d_hasil.is_sebagian
+            FROM
+                t_pres_d_hasil
+            LEFT JOIN t_pres AS t_pres ON
+                t_pres.id = t_pres_d_hasil.t_pres_id
+            LEFT JOIN m_item AS m_item ON
+                m_item.id = t_pres_d_hasil.m_item_id
+            LEFT JOIN t_proses_prod_d AS t_proses_prod_d ON
+                t_proses_prod_d.id = t_pres_d_hasil.t_proses_prod_d_id
+            LEFT JOIN t_proses_prod AS t_proses_prod ON
+                t_proses_prod_d.t_proses_prod_id = t_proses_prod.id
+            LEFT JOIN m_gen AS uom ON
+                uom.id = t_pres_d_hasil.uom_id
+            LEFT JOIN m_gen AS kondisi ON
+                kondisi.id = t_pres_d_hasil.kondisi_id
+            LEFT JOIN m_gudang AS gudang ON
+                gudang.id = t_pres_d_hasil.gudang_id
+            LEFT JOIN default_users AS creator ON
+                creator.id = t_pres_d_hasil.creator_id
+            LEFT JOIN default_users AS editor ON
+                editor.id = t_pres_d_hasil.editor_id
+            LEFT JOIN m_lumbung AS lumbung ON
+                lumbung.id = t_pres_d_hasil.lumbung_id
+            LEFT JOIN t_spk ON
+                t_pres.spk_id = t_spk.id
+            WHERE
+                t_pres.tipe_pres = 'MATERIAL' AND t_pres_d_hasil.is_sebagian = false
+            UNION ALL
+            SELECT
+                t_pres_d_hasil.id,                          -- ID tetap penting untuk identifikasi baris
+                t_pres.id AS t_pres_id,
+                t_pres.no,                                  -- No Reference
+                t_pres.date,                                -- Tanggal
+                t_pres.desc_singkat AS desc_singkat,        -- Deskripsi Singkat
+                t_spk.batch AS batch,                       -- Batch
+                m_item.code AS code,                        -- Code Item
+                m_item.long_name AS long_name,              -- Nama Item
+                timbangan2.qty AS qty,                  -- Qty utama
+                uom.value1 AS uom,                          -- UOM
+                t_pres_d_hasil.m_item_id,
+                t_pres_d_hasil.uom_id,                      -- id uom
+                m_item.uom_conv_id,
+                m_item.conv AS qty_conv,                    -- qty_conv
+                timbangan2.jmlh_jumbo_bag,
+                t_pres_d_hasil.modal,
+                t_pres_d_hasil.gilingan_kecil,
+                t_pres_d_hasil.kadar_air_pct,
+                t_pres_d_hasil.susut_pct,
+                t_pres_d_hasil.ref_jumlah_total,
+                t_proses_prod.name,
+                t_pres.tipe_pres,
+                t_spk.mesin_id AS mesin_id,
+                t_pres_d_hasil.is_sebagian
+            FROM
+                t_pres_d_hasil
+            LEFT JOIN t_pres AS t_pres ON
+                t_pres.id = t_pres_d_hasil.t_pres_id
+            LEFT JOIN m_item AS m_item ON
+                m_item.id = t_pres_d_hasil.m_item_id
+            LEFT JOIN t_proses_prod_d AS t_proses_prod_d ON
+                t_proses_prod_d.id = t_pres_d_hasil.t_proses_prod_d_id
+            LEFT JOIN t_proses_prod AS t_proses_prod ON
+                t_proses_prod_d.t_proses_prod_id = t_proses_prod.id
+            LEFT JOIN m_gen AS uom ON
+                uom.id = t_pres_d_hasil.uom_id
+            LEFT JOIN m_gen AS kondisi ON
+                kondisi.id = t_pres_d_hasil.kondisi_id
+            LEFT JOIN m_gudang AS gudang ON
+                gudang.id = t_pres_d_hasil.gudang_id
+            LEFT JOIN default_users AS creator ON
+                creator.id = t_pres_d_hasil.creator_id
+            LEFT JOIN default_users AS editor ON
+                editor.id = t_pres_d_hasil.editor_id
+            LEFT JOIN m_lumbung AS lumbung ON
+                lumbung.id = t_pres_d_hasil.lumbung_id
+            LEFT JOIN t_pres_sd_timbangan2 AS timbangan2 ON
+                timbangan2.t_pres_d_hasil_id = t_pres_d_hasil.id
+            LEFT JOIN t_spk ON
+                t_pres.spk_id = t_spk.id
+            WHERE
+                t_pres.tipe_pres = 'MATERIAL' AND t_pres_d_hasil.is_sebagian = true
+            UNION ALL
+            SELECT
+                t_pres_d_hasil.id,                          -- ID tetap penting untuk identifikasi baris
+                t_pres.id AS t_pres_id,
+                t_pres.no,                                  -- No Reference
+                t_pres.date,                                -- Tanggal
+                t_pres.desc_singkat AS desc_singkat,        -- Deskripsi Singkat
+                t_spk.batch AS batch,                       -- Batch
+                m_item.code AS code,                        -- Code Item
+                m_item.long_name AS long_name,              -- Nama Item
+                timbangan.qty AS qty,                       -- Qty utama
+                uom.value1 AS uom,                          -- UOM
+                t_pres_d_hasil.m_item_id,
+                t_pres_d_hasil.uom_id,                      -- id uom
+                m_item.uom_conv_id,
+                m_item.conv AS qty_conv,                    -- qty_conv
+                timbangan.jmlh_jumbo_bag,
+                t_pres_d_hasil.modal,
+                t_pres_d_hasil.gilingan_kecil,
+                t_pres_d_hasil.kadar_air_pct,
+                t_pres_d_hasil.susut_pct,
+                t_pres_d_hasil.ref_jumlah_total,
+                t_proses_prod.name,
+                t_pres.tipe_pres,
+                t_spk.mesin_id AS mesin_id,
+                t_pres_d_hasil.is_sebagian
+            FROM
+                t_pres_d_hasil
+            LEFT JOIN t_pres AS t_pres ON
+                t_pres.id = t_pres_d_hasil.t_pres_id
+            LEFT JOIN m_item AS m_item ON
+                m_item.id = t_pres_d_hasil.m_item_id
+            LEFT JOIN t_proses_prod_d AS t_proses_prod_d ON
+                t_proses_prod_d.id = t_pres_d_hasil.t_proses_prod_d_id
+            LEFT JOIN t_proses_prod AS t_proses_prod ON
+                t_proses_prod_d.t_proses_prod_id = t_proses_prod.id
+            LEFT JOIN m_gen AS uom ON
+                uom.id = t_pres_d_hasil.uom_id
+            LEFT JOIN m_gen AS kondisi ON
+                kondisi.id = t_pres_d_hasil.kondisi_id
+            LEFT JOIN m_gudang AS gudang ON
+                gudang.id = t_pres_d_hasil.gudang_id
+            LEFT JOIN default_users AS creator ON
+                creator.id = t_pres_d_hasil.creator_id
+            LEFT JOIN default_users AS editor ON
+                editor.id = t_pres_d_hasil.editor_id
+            LEFT JOIN m_lumbung AS lumbung ON
+                lumbung.id = t_pres_d_hasil.lumbung_id
+            LEFT JOIN t_pres_sd_timbangan AS timbangan ON
+                timbangan.t_pres_d_hasil_id = t_pres_d_hasil.id
+            LEFT JOIN t_spk ON
+                t_pres.spk_id = t_spk.id
+            WHERE
+                t_pres.tipe_pres = 'MATERIAL' AND t_pres_d_hasil.is_sebagian = true");
+    }
