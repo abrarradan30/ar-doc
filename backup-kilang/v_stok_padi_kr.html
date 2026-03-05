@@ -1,0 +1,81 @@
+public function up()
+    {
+        DB::statement("DROP VIEW IF EXISTS {$this->viewName}");
+
+        DB::unprepared("
+        CREATE VIEW {$this->viewName} AS 
+            (
+                SELECT 
+                    tp.id,
+                    tp.date AS tanggal_produksi,
+                    ts.batch AS no_stock_batch,
+                    tpdh.jmlh_jumbo_bag AS jmlh_jumbo_bag,
+                    tpdh.qty AS qty_kg,
+                    mm.name AS oven,
+                    tpdh.modal AS modal_kr,
+                    tpdh.gilingan_kecil AS gk,
+                    tpdh.gb_pct AS gb,
+                    ml.name AS letak_padi_kr,
+                    tpdh.is_sebagian
+                FROM 
+                    t_pres tp
+                    JOIN t_spk ts ON tp.spk_id = ts.id
+                    JOIN m_mesin mm ON mm.id = ts.asal_mesin_id
+                    LEFT JOIN t_pres_d_hasil tpdh ON tp.id = tpdh.t_pres_id
+                    LEFT JOIN m_lumbung ml ON tpdh.lumbung_id = ml.id
+                WHERE 
+                    tp.tipe_pres = 'MATERIAL'
+                    AND COALESCE(tpdh.is_sebagian, false) = false
+            )
+            UNION ALL
+            (
+                SELECT 
+                    tp.id,
+                    tp.date AS tanggal_produksi,
+                    ts.batch AS no_stock_batch,
+                    COALESCE(tpt.jmlh_jumbo_bag, 0) AS jmlh_jumbo_bag,
+                    COALESCE(tpt.qty, 0) AS qty_kg,
+                    mm.name AS oven,
+                    tpdh.modal AS modal_kr,
+                    tpdh.gilingan_kecil AS gk,
+                    tpdh.gb_pct AS gb,
+                    ml2.name AS letak_padi_kr,
+                    tpdh.is_sebagian
+                FROM 
+                    t_pres tp
+                    JOIN t_spk ts ON tp.spk_id = ts.id
+                    JOIN m_mesin mm ON mm.id = ts.asal_mesin_id
+                    LEFT JOIN t_pres_d_hasil tpdh ON tp.id = tpdh.t_pres_id
+                    LEFT JOIN t_pres_sd_timbangan tpt ON tpdh.id = tpt.t_pres_d_hasil_id
+                    LEFT JOIN m_lumbung ml2 ON tpt.lumbung_id = ml2.id
+                WHERE 
+                    tp.tipe_pres = 'MATERIAL'
+                    AND COALESCE(tpdh.is_sebagian, false) = true
+            )
+            UNION ALL
+            (
+                SELECT 
+                    tp.id,
+                    tp.date AS tanggal_produksi,
+                    ts.batch AS no_stock_batch,
+                    COALESCE(tpt2.jmlh_jumbo_bag, 0) AS jmlh_jumbo_bag,
+                    COALESCE(tpt2.qty, 0) AS qty_kg,
+                    mm.name AS oven,
+                    tpdh.modal AS modal_kr,
+                    tpdh.gilingan_kecil AS gk,
+                    tpdh.gb_pct AS gb,
+                    ml3.name AS letak_padi_kr,
+                    tpdh.is_sebagian
+                FROM 
+                    t_pres tp
+                    JOIN t_spk ts ON tp.spk_id = ts.id
+                    JOIN m_mesin mm ON mm.id = ts.asal_mesin_id
+                    LEFT JOIN t_pres_d_hasil tpdh ON tp.id = tpdh.t_pres_id
+                    LEFT JOIN t_pres_sd_timbangan2 tpt2 ON tpdh.id = tpt2.t_pres_d_hasil_id
+                    LEFT JOIN m_lumbung ml3 ON tpt2.lumbung_id = ml3.id
+                WHERE 
+                    tp.tipe_pres = 'MATERIAL'
+                    AND COALESCE(tpdh.is_sebagian, false) = true
+                );
+        ");
+    }
