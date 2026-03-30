@@ -1,0 +1,33 @@
+public function up()
+{
+    DB::statement("DROP VIEW IF EXISTS {$this->viewName}");
+
+    DB::unprepared("
+        CREATE VIEW {$this->viewName} AS
+        SELECT 
+            hp.id,
+            hpd.id AS m_harga_produk_d_id,
+            mi.id AS m_item_id,  
+            mi.code AS kode,  
+            kat1.name AS nama_kategori_1,            
+            mi.long_name AS nama_item,
+            hpd.harga,     
+            mi.conv AS konversi,  
+            gen_uom_conv.id AS uom_konversi_id,	
+            gen_uom_conv.value1 AS uom_konversi,
+            gen_uom_f.id AS uom_id,     
+            gen_uom_f.value1 AS uom_from,
+            hpd.status AS status_detail,
+            gen_tipe.value1 AS tipe_customer,
+            gen_tipe.id AS tipe_customer_id
+        FROM m_harga_produk_d hpd
+        LEFT JOIN m_harga_produk hp ON hpd.m_harga_produk_id = hp.id
+        LEFT JOIN m_gen gen_tipe ON hp.cust_type_id = gen_tipe.id
+        LEFT JOIN m_cat kat1 ON hp.kategori_1_id = kat1.id
+        LEFT JOIN m_cat kat2 ON hp.kategori_2_id = kat2.id
+        LEFT JOIN m_cat kat3 ON hp.kategori_3_id = kat3.id
+        LEFT JOIN m_item mi ON mi.id = hpd.m_item_id
+        LEFT JOIN m_gen gen_uom_conv ON mi.uom_conv_id = gen_uom_conv.id
+        LEFT JOIN m_gen gen_uom_f ON gen_uom_f.id = mi.uom_id
+    ");
+}
