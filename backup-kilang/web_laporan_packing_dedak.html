@@ -1,0 +1,127 @@
+@php
+$req = app()->request;
+$helper = getCore('Helper');
+
+// filter item 
+$itemIds = $req->get('m_item_id');
+if (!empty($itemIds) && !is_array($itemIds)) {
+    $itemIds = explode(',', $itemIds);
+}
+
+// filter person 
+$personIds = $req->get('person_id');
+if (!empty($personIds) && !is_array($personIds)) {
+    $personIds = explode(',', $personIds);
+}
+$personIds = !empty($personIds) ? array_filter($personIds) : [];
+
+$data = \DB::table('t_pres as tpres')
+    ->leftJoin('t_pres_d_sampingan as tpds','tpds.t_pres_id','=','tpres.id')
+    ->leftJoin('t_pres_sd_sampingan_personal as tpssp','tpssp.t_pres_d_sampingan_id','=','tpds.id')
+    ->leftJoin('t_spk as tspk','tspk.id','=','tpres.spk_id')
+    ->leftJoin('t_get_hris_kary as tghk','tghk.id','=','tpssp.personal_packing_id')
+    ->leftJoin('m_item as mi','mi.id','=','tpds.m_item_id')
+    ->leftJoin('m_gen as mg', 'mg.id', '=', 'tpds.uom_id')
+    ->select([
+      // header
+      'tghk.nama_lengkap',
+
+      // data
+      'tpres.id as t_pres_id',  
+      'tpres.no as no_pres',  
+      'tpres.date',  
+      'tpds.qty as qty_sampingan',  
+      'mi.long_name as nama_item',  
+      'mg.value1 as uom',  
+    ])
+    ->where('tspk.tipe_bahan', 'LANJUTAN')
+    ->where('mi.m_cat1_id', '19')
+    ->when(!empty($itemIds), function ($q) use ($itemIds) {
+        $q->whereIn('tpds.m_item_id', $itemIds);
+    })
+    ->when(!empty($personIds), function ($q) use ($personIds) {
+        $q->whereIn('tpssp.personal_packing_id', $personIds);
+    })
+    ->when($req->periode_from, function ($q) use ($req) {
+        $q->whereDate('tpres.date', '>=', date('Y-m-d', strtotime($req->periode_from)));
+    })
+    ->when($req->periode_to, function ($q) use ($req) {
+        $q->whereDate('tpres.date', '<=', date('Y-m-d', strtotime($req->periode_to)));
+    })
+    ->groupBy(
+      'tpds.m_item_id',
+      'mi.long_name',
+      'tghk.nama_lengkap',
+      'mg.value1',
+      'tpres.no',   
+      'tpres.id', 
+      'tpds.qty'
+    )
+    ->orderBy('mi.long_name')
+    ->orderBy('tghk.nama_lengkap')
+    ->orderBy('tpres.id')
+    ->get();
+
+$data = $data->groupBy(function ($item) {
+    return $item->nama_lengkap ?? 'TANPA PERSONAL PACKING';
+});
+
+@endphp
+
+<div style="max-width: 1400px; margin: 0 auto; padding: 20px; border-radius: 8px;">
+  
+  <div>
+    <h1 style="font-weight: bold; text-align: center;">LAPORAN PERSONAL PACKING DEDAK</h1>
+    <p style="text-align: center;">
+      Periode :
+      {{ @$req->periode_from ? $helper->formatDateId(@$req->periode_from) : '-' }}
+      {{ @$req->periode_to ? '- ' . $helper->formatDateId(@$req->periode_to) : '' }}
+    </p>
+    <br>
+  </div>
+
+ @foreach($data as $person => $rows)
+  <table style="width: 100%; border-collapse: collapse; font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; border: 1px solid #e2e8f0;">
+    <thead>
+        <tr>
+            <th colspan="6" style="background-color: #f1f5f9; color: #334155; padding: 12px; text-align: left; font-size: 14px; font-weight: bold; letter-spacing: 0.5px;">
+                Personal Packing : {{ $person ?? '-' }}
+            </th>
+        </tr>
+        <tr style="background-color: #f1f5f9; color: #334155; border-bottom: 2px solid #cbd5e1;">
+            <th style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">No</th>
+            <th style="padding: 12px; text-align: left; border: 1px solid #e2e8f0;">No Hasil Penggilingan</th>
+            <th style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">Tanggal</th>
+            <th style="padding: 12px; text-align: left; border: 1px solid #e2e8f0;">Nama Item</th>
+            <th style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">Qty</th>
+            <th style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">UoM</th>
+        </tr>
+    </thead>
+    <tbody>
+      @foreach($rows as $row)
+        <tr style="border-bottom: 1px solid #e2e8f0; background-color: #ffffff;">
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">{{ $loop->iteration }}</td>
+            <td style="padding: 12px; text-align: left; border: 1px solid #e2e8f0;">{{ $row->no_pres}}</td>
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">{{ $row->date ? date('d-m-Y', strtotime($row->date)) : '-' }}</td>
+            <td style="padding: 12px; text-align: left; border: 1px solid #e2e8f0;">{{ $row->nama_item }}</td>
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0; font-weight: 600; color: #0f172a;">{{ number_format($row->qty_sampingan,0,',','.') }}</td>
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0;">{{ $row->uom }}</td>
+        </tr>
+      @endforeach 
+    </tbody>
+    <tfoot>
+       @php
+        $grandQty = $rows->sum('qty_sampingan');
+       @endphp
+        <tr style="background-color: #f8fafc; font-weight: bold; border-top: 2px solid #cbd5e1;">
+            <td colspan="4" style="padding: 12px; text-align: right; border: 1px solid #e2e8f0; color: #334155;">TOTAL</td>
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0; color: #1e3a8a; font-size: 15px;">{{ number_format($grandQty,0,',','.') }}</td>
+            <td style="padding: 12px; text-align: center; border: 1px solid #e2e8f0; color: #334155;"></td>
+        </tr>
+    </tfoot>
+  </table>
+  
+  <br>
+ @endforeach
+
+</div>
